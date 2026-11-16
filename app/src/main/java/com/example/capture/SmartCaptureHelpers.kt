@@ -1,0 +1,239 @@
+package com.example.capture
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.hardware.display.DisplayManager
+import android.view.Display
+import android.view.Surface
+import kotlin.math.acos
+import kotlin.math.sqrt
+
+data class Depth16Buffer(
+    val millimeters: ShortArray,
+    val width: Int,
+    val height: Int
+)
+
+object SmartCaptureHelpers {
+
+    fun getDisplayRotation(context: Context): Int {
+        val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+        return dm.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: Surface.ROTATION_0
+    }
+
+    fun getBackCameraDisplayRotationDegrees(context: Context): Int {
+        val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val backId = cm.cameraIdList.firstOrNull { id ->
+            cm.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) ==
+                CameraCharacteristics.LENS_FACING_BACK
+        } ?: return 90
+        val sensorOrientation = cm.getCameraCharacteristics(backId)
+            .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val displayDegrees = when (getDisplayRotation(context)) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        return (sensorOrientation - displayDegrees + 360) % 360
+    }
+
+    fun rotateDepth16(
+        rawMm: ShortArray,
+        width: Int,
+        height: Int,
+        rotationDegrees: Int
+    ): Depth16Buffer {
+        val norm = ((rotationDegrees % 360) + 360) % 360
+        if (norm == 0) return Depth16Buffer(rawMm, width, height)
+        val out = ShortArray(rawMm.size)
+        return when (norm) {
+            90 -> {
+                val newW = height
+                val newH = width
+                for (y in 0 until height) {
+                    for (x in 0 until width) {
+                        val nx = height - 1 - y
+                        val ny = x
+                        out[ny * newW + nx] = rawMm[y * width + x]
+                    }
+                }
+                Depth16Buffer(out, newW, newH)
+            }
+            180 -> {
+                for (y in 0 until height) {
+                    for (x in 0 until width) {
+                        val nx = width - 1 - x
+                        val ny = height - 1 - y
+                        out[ny * width + nx] = rawMm[y * width + x]
+                    }
+                }
+                Depth16Buffer(out, width, height)
+            }
+            270 -> {
+                val newW = height
+                val newH = width
+                for (y in 0 until height) {
+                    for (x in 0 until width) {
+                        val nx = y
+                        val ny = width - 1 - x
+                        out[ny * newW + nx] = rawMm[y * width + x]
+                    }
+                }
+                Depth16Buffer(out, newW, newH)
+            }
+            else -> Depth16Buffer(rawMm, width, height)
+        }
+    }
+
+    fun medianCenterDepthMeters(rawMm: ShortArray, width: Int, height: Int): Float? {
+        if (width <= 0 || height <= 0 || rawMm.isEmpty()) return null
+        val samples = ArrayList<Float>(100)
+        val xStart = (width * 0.35f).toInt()
+        val xEnd = (width * 0.65f).toInt()
+        val yStart = (height * 0.35f).toInt()
+        val yEnd = (height * 0.65f).toInt()
+        for (y in yStart until yEnd step 4) {
+            for (x in xStart until xEnd step 4) {
+                val mm = rawMm[y * width + x].toInt() and 0xFFFF
+                if (mm in 150..12000) {
+                    samples.add(mm / 1000f)
+                }
+            }
+        }
+        if (samples.size < 8) return null
+        samples.sort()
+        return samples[samples.size / 2]
+    }
+
+    fun translationDistance(
+        ax: Float, ay: Float, az: Float,
+        bx: Float, by: Float, bz: Float
+    ): Float {
+        val dx = ax - bx
+        val dy = ay - by
+        val dz = az - bz
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    }
+
+    fun quaternionAngleDegrees(
+        aqx: Float, aqy: Float, aqz: Float, aqw: Float,
+        bqx: Float, bqy: Float, bqz: Float, bqw: Float
+    ): Float {
+        val dot = (aqx * bqx + aqy * bqy + aqz * bqz + aqw * bqw)
+            .let { kotlin.math.abs(it) }
+            .coerceIn(0f, 1f)
+        val rad = 2f * acos(dot)
+        return rad * 180f / kotlin.math.PI.toFloat()
+    }
+
+    /**
+     * Projects a world-space displacement (dwx, dwy, dwz) onto the local Right (+X)
+     * and Up (+Y) axes defined by orientation quaternion (qx, qy, qz, qw).
+     */
+    fun projectWorldDeltaToCameraRightUp(
+        dwx: Float,
+        dwy: Float,
+        dwz: Float,
+        qx: Float,
+        qy: Float,
+        qz: Float,
+        qw: Float
+    ): Pair<Float, Float> {
+        val rightX = 1f - 2f * (qy * qy + qz * qz)
+        val rightY = 2f * (qx * qy + qw * qz)
+        val rightZ = 2f * (qx * qz - qw * qy)
+
+        val upX = 2f * (qx * qy - qw * qz)
+        val upY = 1f - 2f * (qx * qx + qz * qz)
+        val upZ = 2f * (qy * qz + qw * qx)
+
+        val dxRight = dwx * rightX + dwy * rightY + dwz * rightZ
+        val dyUp = dwx * upX + dwy * upY + dwz * upZ
+        return dxRight to dyUp
+    }
+
+    /**
+     * Computes valid ARCore Depth16 coverage [0f..1f] for each cell in a cols x rows grid.
+     */
+    fun computeTileDepthDensities(
+        rawMm: ShortArray,
+        width: Int,
+        height: Int,
+        cols: Int = 4,
+        rows: Int = 4
+    ): FloatArray {
+        val out = FloatArray(cols * rows)
+        if (width <= 0 || height <= 0 || rawMm.size < width * height) return out
+        val stepX = (width / (cols * 6)).coerceAtLeast(1)
+        val stepY = (height / (rows * 6)).coerceAtLeast(1)
+
+        for (r in 0 until rows) {
+            val y0 = r * height / rows
+            val y1 = ((r + 1) * height / rows).coerceAtMost(height)
+            for (c in 0 until cols) {
+                val x0 = c * width / cols
+                val x1 = ((c + 1) * width / cols).coerceAtMost(width)
+                var valid = 0
+                var total = 0
+                var y = y0
+                while (y < y1) {
+                    val rowOffset = y * width
+                    var x = x0
+                    while (x < x1) {
+                        val mm = rawMm[rowOffset + x].toInt() and 0xFFFF
+                        if (mm in 150..12000) valid++
+                        total++
+                        x += stepX
+                    }
+                    y += stepY
+                }
+                out[r * cols + c] = if (total > 0) (valid.toFloat() / total) else 0f
+            }
+        }
+        return out
+    }
+
+    /**
+     * Estimates optical sharpness via center-crop gradient energy so the sharpest frame becomes the RGB hero.
+     */
+    fun measureBitmapSharpness(bitmap: Bitmap): Float {
+        val sampleW = 96
+        val sampleH = 96
+        val thumb = Bitmap.createScaledBitmap(bitmap, sampleW, sampleH, true)
+        val px = IntArray(sampleW * sampleH)
+        thumb.getPixels(px, 0, sampleW, 0, 0, sampleW, sampleH)
+        if (thumb !== bitmap) thumb.recycle()
+
+        var energy = 0.0
+        var count = 0
+        for (y in 16 until sampleH - 16) {
+            val row = y * sampleW
+            val nextRow = (y + 1) * sampleW
+            for (x in 16 until sampleW - 16) {
+                val c = px[row + x]
+                val cr = px[row + x + 1]
+                val cb = px[nextRow + x]
+                val lumaC = ((c shr 16) and 0xFF) * 0.3f + ((c shr 8) and 0xFF) * 0.59f + (c and 0xFF) * 0.11f
+                val lumaR = ((cr shr 16) and 0xFF) * 0.3f + ((cr shr 8) and 0xFF) * 0.59f + (cr and 0xFF) * 0.11f
+                val lumaB = ((cb shr 16) and 0xFF) * 0.3f + ((cb shr 8) and 0xFF) * 0.59f + (cb and 0xFF) * 0.11f
+                val dx = lumaC - lumaR
+                val dy = lumaC - lumaB
+                energy += (dx * dx + dy * dy)
+                count++
+            }
+        }
+        return if (count > 0) (energy / count).toFloat() else 0f
+    }
+
+    fun scaleDownMaxEdge(bitmap: Bitmap, maxEdge: Int = 1600): Bitmap {
+        val longest = maxOf(bitmap.width, bitmap.height)
+        if (longest <= maxEdge) return bitmap
+        val ratio = maxEdge.toFloat() / longest
+        val w = (bitmap.width * ratio).toInt().coerceAtLeast(1)
+        val h = (bitmap.height * ratio).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(bitmap, w, h, true)
+    }
+}

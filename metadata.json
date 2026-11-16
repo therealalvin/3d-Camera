@@ -1,0 +1,6 @@
+{
+  "name": "3d Camera",
+  "description": "Capture effortless 3D spatial photos on Pixel using motion sensors and depth, saved as universal Dynamic Depth JPEGs for Google Photos, interactive 3D tilt viewing, and Meta Quest VR export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
