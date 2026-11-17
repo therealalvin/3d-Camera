@@ -6,15 +6,21 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.util.Base64
 import androidx.exifinterface.media.ExifInterface
+import com.example.capture.Depth16Buffer
+import com.example.capture.RelativeFramePose
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 data class RefinedDepthResult(
     val depthBitmap: Bitmap,
@@ -44,6 +50,14 @@ data class StereoNeighborObservation(
     val dxRight: Float,
     val dyUp: Float,
     val weight: Float = 1f
+)
+
+data class RectifiedFrameResult(
+    val bitmap: Bitmap,
+    val residualDxPx: Float,
+    val residualDyPx: Float,
+    val edgeMatchScore: Float,
+    val relRollDeg: Float
 )
 
 object DynamicDepthCodec {
@@ -121,12 +135,38 @@ object DynamicDepthCodec {
             }
         }
 
+        // Aspect-ratio-matched mapping ensures RGB and Depth16 align cleanly even if camera & depth streams differ
+        val colorAspect = outW.toFloat() / outH
+        val depthAspect = depthWidth.toFloat() / depthHeight
+        val cropDepthScaleX: Float
+        val cropDepthScaleY: Float
+        val cropDepthOffX: Float
+        val cropDepthOffY: Float
+        if (depthAspect > colorAspect + 0.02f) {
+            cropDepthScaleX = colorAspect / depthAspect
+            cropDepthScaleY = 1f
+            cropDepthOffX = (1f - cropDepthScaleX) * 0.5f
+            cropDepthOffY = 0f
+        } else if (colorAspect > depthAspect + 0.02f) {
+            cropDepthScaleX = 1f
+            cropDepthScaleY = depthAspect / colorAspect
+            cropDepthOffX = 0f
+            cropDepthOffY = (1f - cropDepthScaleY) * 0.5f
+        } else {
+            cropDepthScaleX = 1f
+            cropDepthScaleY = 1f
+            cropDepthOffX = 0f
+            cropDepthOffY = 0f
+        }
+
         val outDepths = FloatArray(outW * outH)
         for (y in 0 until outH) {
-            val cy = (y * depthHeight / outH).coerceIn(0, depthHeight - 1)
+            val vNorm = cropDepthOffY + (y.toFloat() / outH) * cropDepthScaleY
+            val cy = (vNorm * depthHeight).toInt().coerceIn(0, depthHeight - 1)
             val rowOut = y * outW
             for (x in 0 until outW) {
-                val cx = (x * depthWidth / outW).coerceIn(0, depthWidth - 1)
+                val uNorm = cropDepthOffX + (x.toFloat() / outW) * cropDepthScaleX
+                val cx = (uNorm * depthWidth).toInt().coerceIn(0, depthWidth - 1)
                 val centerLuma = guideLuma[rowOut + x]
 
                 var weightSum = 0f
@@ -134,13 +174,15 @@ object DynamicDepthCodec {
 
                 for (dy in -2..2) {
                     val ry = (cy + dy).coerceIn(0, depthHeight - 1)
-                    val gSampleY = ((ry * outH) / depthHeight).coerceIn(0, outH - 1)
+                    val gSampleY = (((ry.toFloat() / depthHeight - cropDepthOffY) / cropDepthScaleY) * outH)
+                        .toInt().coerceIn(0, outH - 1)
                     val gRow = gSampleY * outW
                     val rRow = ry * depthWidth
                     val lutRow = (dy + 2) * 5
                     for (dx in -2..2) {
                         val rx = (cx + dx).coerceIn(0, depthWidth - 1)
-                        val gSampleX = ((rx * outW) / depthWidth).coerceIn(0, outW - 1)
+                        val gSampleX = (((rx.toFloat() / depthWidth - cropDepthOffX) / cropDepthScaleX) * outW)
+                            .toInt().coerceIn(0, outW - 1)
                         val dLuma = abs(centerLuma - guideLuma[gRow + gSampleX])
                         val w = lumaLut1[dLuma] * spaceLut1[lutRow + dx + 2]
                         weightSum += w
@@ -193,20 +235,10 @@ object DynamicDepthCodec {
         val invNear = 1f / nearM
         val invFar = 1f / farM
         val invRange = max(1e-4f, invNear - invFar)
-        val borderMarginX = (outW * 0.04f).coerceAtLeast(2f)
-        val borderMarginY = (outH * 0.04f).coerceAtLeast(2f)
-        for (y in 0 until outH) {
-            val edgeY = min(y / borderMarginY, (outH - 1 - y) / borderMarginY).coerceIn(0f, 1f)
-            val rowOff = y * outW
-            for (x in 0 until outW) {
-                val edgeX = min(x / borderMarginX, (outW - 1 - x) / borderMarginX).coerceIn(0f, 1f)
-                val borderBlend = min(edgeX, edgeY)
-                val invNormRaw = (((1f / polishedDepths[rowOff + x]) - invFar) / invRange).coerceIn(0f, 1f)
-                // Gently relax extreme 4% outer margin toward neutral depth (0.35) to eliminate border edge warping
-                val invNorm = invNormRaw * borderBlend + 0.35f * (1f - borderBlend)
-                val gray = (invNorm * 255f).roundToInt().coerceIn(0, 255)
-                outPixels[rowOff + x] = Color.rgb(gray, gray, gray)
-            }
+        for (i in outPixels.indices) {
+            val invNorm = (((1f / polishedDepths[i]) - invFar) / invRange).coerceIn(0f, 1f)
+            val gray = (invNorm * 255f).roundToInt().coerceIn(0, 255)
+            outPixels[i] = Color.rgb(gray, gray, gray)
         }
 
         val depthBitmap = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
@@ -311,6 +343,287 @@ object DynamicDepthCodec {
     }
 
     /**
+     * Mathematically rectifies a captured frame onto the Hero frame's optical plane using its
+     * tracked 3D orientation (yaw pan, pitch tilt, in-plane roll), refines residual edge alignment
+     * via coarse-to-fine Sobel-edge + luma matching on a tiny grid, then performs a single crisp
+     * bilinear projective resample directly from the source pixels.
+     * Uncovered border margins are left transparent (alpha = 0) so downstream blending is seamless.
+     */
+    fun rectifyFrameToHeroPlane(
+        heroBitmap: Bitmap,
+        sourceBitmap: Bitmap,
+        relativePose: RelativeFramePose,
+        maxRefineShiftPxFraction: Float = 0.06f
+    ): RectifiedFrameResult {
+        val w = heroBitmap.width
+        val h = heroBitmap.height
+        val srcW = sourceBitmap.width
+        val srcH = sourceBitmap.height
+        val cx = (w - 1) * 0.5f
+        val cy = (h - 1) * 0.5f
+        val sCx = (srcW - 1) * 0.5f
+        val sCy = (srcH - 1) * 0.5f
+        val focalHero = 0.88f * max(w, h)
+        val focalSrc = 0.88f * max(srcW, srcH)
+
+        // Clamp extreme synthetic angles so homography stays well-conditioned inside FOV
+        val yawRad = (relativePose.relYawDeg.coerceIn(-28f, 28f)) * PI.toFloat() / 180f
+        val pitchRad = (relativePose.relPitchDeg.coerceIn(-24f, 24f)) * PI.toFloat() / 180f
+        val rollRad = (relativePose.relRollDeg.coerceIn(-35f, 35f)) * PI.toFloat() / 180f
+
+        // Neighbor camera orthonormal basis expressed in Hero coordinates (+X right, +Y up, +Z forward)
+        val cosP = cos(pitchRad)
+        val sinP = sin(pitchRad)
+        val cosY = cos(yawRad)
+        val sinY = sin(yawRad)
+        val fwdX = cosP * sinY
+        val fwdY = sinP
+        val fwdZ = cosP * cosY
+
+        val r0x = cosY
+        val r0y = 0f
+        val r0z = -sinY
+
+        val u0x = fwdY * r0z - fwdZ * r0y
+        val u0y = fwdZ * r0x - fwdX * r0z
+        val u0z = fwdX * r0y - fwdY * r0x
+        val uLen = sqrt(u0x * u0x + u0y * u0y + u0z * u0z).coerceAtLeast(1e-5f)
+        val unX = u0x / uLen
+        val unY = u0y / uLen
+        val unZ = u0z / uLen
+
+        // Apply CW camera roll around optical axis
+        val cosR = cos(rollRad)
+        val sinR = sin(rollRad)
+        val rFx = r0x * cosR - unX * sinR
+        val rFy = r0y * cosR - unY * sinR
+        val rFz = r0z * cosR - unZ * sinR
+
+        val uFx = unX * cosR + r0x * sinR
+        val uFy = unY * cosR + r0y * sinR
+        val uFz = unZ * cosR + r0z * sinR
+
+        val srcPx = IntArray(srcW * srcH)
+        sourceBitmap.getPixels(srcPx, 0, srcW, 0, 0, srcW, srcH)
+
+        // Step 1: Fast 96x72 homography projection for coarse-to-fine edge + luma alignment
+        val gridW = 96
+        val gridH = (96f * h / max(1, w)).roundToInt().coerceIn(56, 96)
+        val heroThumb = bitmapToLumaGrid(heroBitmap, gridW, gridH)
+        val srcThumb = FloatArray(gridW * gridH)
+        val srcAlpha = IntArray(gridW * gridH)
+
+        for (gy in 0 until gridH) {
+            val uH_y = (gy.toFloat() / max(1, gridH - 1)) * (h - 1)
+            val dyH = -(uH_y - cy) / focalHero
+            val rowOff = gy * gridW
+            for (gx in 0 until gridW) {
+                val uH_x = (gx.toFloat() / max(1, gridW - 1)) * (w - 1)
+                val dxH = (uH_x - cx) / focalHero
+                val zF = dxH * fwdX + dyH * fwdY + fwdZ
+                if (zF <= 0.15f) continue
+                val xF = dxH * rFx + dyH * rFy + rFz
+                val yF = dxH * uFx + dyH * uFy + uFz
+                val sx = (sCx + focalSrc * (xF / zF)).roundToInt()
+                val sy = (sCy - focalSrc * (yF / zF)).roundToInt()
+                if (sx in 0 until srcW && sy in 0 until srcH) {
+                    val c = srcPx[sy * srcW + sx]
+                    val a = (c ushr 24) and 0xFF
+                    srcAlpha[rowOff + gx] = a
+                    srcThumb[rowOff + gx] =
+                        0.299f * ((c shr 16) and 0xFF) + 0.587f * ((c shr 8) and 0xFF) + 0.114f * (c and 0xFF)
+                }
+            }
+        }
+
+        val heroEdges = computeEdgeMap(heroThumb, gridW, gridH)
+        val srcEdges = computeEdgeMap(srcThumb, gridW, gridH)
+
+        val maxSearchGrid = (maxRefineShiftPxFraction * gridW).roundToInt().coerceIn(3, 12)
+        var bestDxGrid = 0
+        var bestDyGrid = 0
+        var bestCost = Float.MAX_VALUE
+        var zeroShiftCost = Float.MAX_VALUE
+
+        for (dy in -maxSearchGrid..maxSearchGrid) {
+            for (dx in -maxSearchGrid..maxSearchGrid) {
+                var lumaSum = 0f
+                var edgeSum = 0f
+                var validSamples = 0
+                for (y in 4 until gridH - 4 step 2) {
+                    val sy = y - dy
+                    if (sy !in 2 until gridH - 2) continue
+                    val hRow = y * gridW
+                    val sRow = sy * gridW
+                    for (x in 4 until gridW - 4 step 2) {
+                        val sx = x - dx
+                        if (sx !in 2 until gridW - 2) continue
+                        if (srcAlpha[sRow + sx] < 245) continue
+                        lumaSum += abs(heroThumb[hRow + x] - srcThumb[sRow + sx])
+                        edgeSum += abs(heroEdges[hRow + x] - srcEdges[sRow + sx])
+                        validSamples++
+                    }
+                }
+                if (validSamples < 32) continue
+                val normCost = (lumaSum * 0.52f + edgeSum * 0.48f) / validSamples
+                if (dx == 0 && dy == 0) zeroShiftCost = normCost
+                if (normCost < bestCost) {
+                    bestCost = normCost
+                    bestDxGrid = dx
+                    bestDyGrid = dy
+                }
+            }
+        }
+
+        val useShift = (bestDxGrid != 0 || bestDyGrid != 0) && bestCost < zeroShiftCost * 0.94f
+        val shiftDxPx = if (useShift) bestDxGrid.toFloat() * w / gridW else 0f
+        val shiftDyPx = if (useShift) bestDyGrid.toFloat() * h / gridH else 0f
+
+        // Step 2: Single-pass projective bilinear warp directly from unblurred source pixels
+        val outPx = IntArray(w * h)
+        val invFocalHero = 1f / focalHero
+        val stepXfDx = rFx * invFocalHero * focalSrc
+        val stepYfDx = uFx * invFocalHero * focalSrc
+        val stepZfDx = fwdX * invFocalHero
+
+        for (y in 0 until h) {
+            val dyH = -(y - shiftDyPx - cy) * invFocalHero
+            val rowBaseX = dyH * rFy + rFz
+            val rowBaseY = dyH * uFy + uFz
+            val rowBaseZ = dyH * fwdY + fwdZ
+
+            val startDxH = (-shiftDxPx - cx) * invFocalHero
+            var xF = (startDxH * rFx + rowBaseX) * focalSrc
+            var yF = (startDxH * uFx + rowBaseY) * focalSrc
+            var zF = startDxH * fwdX + rowBaseZ
+            val outRow = y * w
+
+            for (x in 0 until w) {
+                if (zF > 0.15f) {
+                    val invZ = 1f / zF
+                    val uSrc = sCx + xF * invZ
+                    val vSrc = sCy - yF * invZ
+                    val x0 = uSrc.toInt()
+                    val y0 = vSrc.toInt()
+                    if (uSrc >= 0f && vSrc >= 0f && x0 < srcW - 1 && y0 < srcH - 1) {
+                        val fx = uSrc - x0
+                        val fy = vSrc - y0
+                        val r0 = y0 * srcW + x0
+                        val r1 = r0 + srcW
+                        val c00 = srcPx[r0]
+                        val c10 = srcPx[r0 + 1]
+                        val c01 = srcPx[r1]
+                        val c11 = srcPx[r1 + 1]
+
+                        val w00 = (1f - fx) * (1f - fy)
+                        val w10 = fx * (1f - fy)
+                        val w01 = (1f - fx) * fy
+                        val w11 = fx * fy
+
+                        val a = (((c00 ushr 24) and 0xFF) * w00 + ((c10 ushr 24) and 0xFF) * w10 +
+                            ((c01 ushr 24) and 0xFF) * w01 + ((c11 ushr 24) and 0xFF) * w11).roundToInt().coerceIn(0, 255)
+                        val r = (((c00 shr 16) and 0xFF) * w00 + ((c10 shr 16) and 0xFF) * w10 +
+                            ((c01 shr 16) and 0xFF) * w01 + ((c11 shr 16) and 0xFF) * w11).roundToInt().coerceIn(0, 255)
+                        val g = (((c00 shr 8) and 0xFF) * w00 + ((c10 shr 8) and 0xFF) * w10 +
+                            ((c01 shr 8) and 0xFF) * w01 + ((c11 shr 8) and 0xFF) * w11).roundToInt().coerceIn(0, 255)
+                        val b = ((c00 and 0xFF) * w00 + (c10 and 0xFF) * w10 +
+                            (c01 and 0xFF) * w01 + (c11 and 0xFF) * w11).roundToInt().coerceIn(0, 255)
+
+                        outPx[outRow + x] = (a shl 24) or (r shl 16) or (g shl 8) or b
+                    } else if (x0 in 0 until srcW && y0 in 0 until srcH && uSrc >= -0.49f && vSrc >= -0.49f) {
+                        outPx[outRow + x] = srcPx[y0 * srcW + x0]
+                    }
+                }
+                xF += stepXfDx
+                yF += stepYfDx
+                zF += stepZfDx
+            }
+        }
+
+        val finalBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+            setPixels(outPx, 0, w, 0, 0, w, h)
+        }
+
+        val finalCost = if (bestCost < Float.MAX_VALUE) min(bestCost, zeroShiftCost) else 35f
+        val edgeMatchScore = (1f - (finalCost / 42f)).coerceIn(0f, 1f)
+        return RectifiedFrameResult(
+            bitmap = finalBitmap,
+            residualDxPx = shiftDxPx,
+            residualDyPx = shiftDyPx,
+            edgeMatchScore = edgeMatchScore,
+            relRollDeg = relativePose.relRollDeg
+        )
+    }
+
+    /**
+     * Warps a neighbor ARCore Depth16 buffer by its relative camera roll & aligned residual offset
+     * so multi-frame depth consensus preserves crisp foreground edges even from tilted shots.
+     */
+    fun rectifyDepth16ToHero(
+        depthBuffer: Depth16Buffer,
+        relRollDeg: Float,
+        residualDxRatio: Float,
+        residualDyRatio: Float
+    ): Depth16Buffer {
+        val w = depthBuffer.width
+        val h = depthBuffer.height
+        if (w <= 0 || h <= 0) return depthBuffer
+        if (abs(relRollDeg) < 0.8f && abs(residualDxRatio) < 0.008f && abs(residualDyRatio) < 0.008f) {
+            return depthBuffer
+        }
+        val rad = (relRollDeg * PI.toFloat() / 180f)
+        val cosA = cos(rad)
+        val sinA = sin(rad)
+        val cx = (w - 1) * 0.5f
+        val cy = (h - 1) * 0.5f
+        val shiftX = residualDxRatio * w
+        val shiftY = residualDyRatio * h
+
+        val src = depthBuffer.millimeters
+        val dst = ShortArray(w * h)
+        for (y in 0 until h) {
+            val rowOff = y * w
+            val dy = y - shiftY - cy
+            for (x in 0 until w) {
+                val dx = x - shiftX - cx
+                val sx = (cx + dx * cosA + dy * sinA).roundToInt()
+                val sy = (cy - dx * sinA + dy * cosA).roundToInt()
+                if (sx in 0 until w && sy in 0 until h) {
+                    dst[rowOff + x] = src[sy * w + sx]
+                }
+            }
+        }
+        return Depth16Buffer(dst, w, h)
+    }
+
+    /**
+     * Blends pose-rectified sweep frames onto stationary objects in the Hero RGB image with
+     * transparent-border gating and smooth spatial edge feathering for distortion-free output.
+     */
+    fun enhanceHeroWithAlignedFrames(
+        heroBitmap: Bitmap,
+        rectifiedFrames: List<RectifiedFrameResult>
+    ): Bitmap {
+        val validSources = rectifiedFrames
+            .asSequence()
+            .filter {
+                !it.bitmap.isRecycled &&
+                    it.bitmap.width == heroBitmap.width &&
+                    it.bitmap.height == heroBitmap.height &&
+                    it.edgeMatchScore >= 0.35f
+            }
+            .sortedByDescending { it.edgeMatchScore }
+            .take(3)
+            .toList()
+        if (validSources.isEmpty()) return heroBitmap
+
+        return blendAlignedBitmapsInternal(
+            heroBitmap = heroBitmap,
+            sources = validSources.map { it.bitmap to it.edgeMatchScore }
+        )
+    }
+
+    /**
      * Locally aligns and blends up to 3 crisp sweep frames onto stationary objects in the hero RGB image,
      * reducing sensor noise and compression artifacts while rejecting any misaligned/moving pixels.
      */
@@ -322,6 +635,16 @@ object DynamicDepthCodec {
             it !== heroBitmap && !it.isRecycled && it.width == heroBitmap.width && it.height == heroBitmap.height
         }.take(2)
         if (sources.isEmpty()) return heroBitmap
+        return blendAlignedBitmapsInternal(
+            heroBitmap = heroBitmap,
+            sources = sources.map { it to 0.85f }
+        )
+    }
+
+    private fun blendAlignedBitmapsInternal(
+        heroBitmap: Bitmap,
+        sources: List<Pair<Bitmap, Float>>
+    ): Bitmap {
 
         val w = heroBitmap.width
         val h = heroBitmap.height
@@ -341,10 +664,11 @@ object DynamicDepthCodec {
         }
 
         val nbPx = IntArray(w * h)
-        val block = 32
-        val search = 6
+        val block = 24
+        val search = 5
+        val edgeFeatherPx = 12f
 
-        for (nb in sources) {
+        for ((nb, frameScore) in sources) {
             nb.getPixels(nbPx, 0, w, 0, 0, w, h)
             var by = 0
             while (by < h) {
@@ -352,7 +676,7 @@ object DynamicDepthCodec {
                 var bx = 0
                 while (bx < w) {
                     val bw = min(block, w - bx)
-                    // Find best integer shift (dx, dy) matching stationary detail inside this block
+                    // Find best fine integer shift (dx, dy) matching stationary detail inside this block
                     var bestDx = 0
                     var bestDy = 0
                     var bestCost = Int.MAX_VALUE
@@ -363,27 +687,29 @@ object DynamicDepthCodec {
                         while (dx <= search) {
                             var cost = 0
                             var samples = 0
-                            var sy = 4
-                            while (sy < bh - 4) {
+                            var sy = 3
+                            while (sy < bh - 3) {
                                 val hy = by + sy
                                 val ny = (hy + dy).coerceIn(0, h - 1)
                                 val hRow = hy * w
                                 val nRow = ny * w
-                                var sx = 4
-                                while (sx < bw - 4) {
+                                var sx = 3
+                                while (sx < bw - 3) {
                                     val hx = bx + sx
                                     val nx = (hx + dx).coerceIn(0, w - 1)
-                                    val hc = heroPx[hRow + hx]
                                     val nc = nbPx[nRow + nx]
-                                    cost += abs(((hc shr 16) and 0xFF) - ((nc shr 16) and 0xFF)) +
-                                        abs(((hc shr 8) and 0xFF) - ((nc shr 8) and 0xFF)) +
-                                        abs((hc and 0xFF) - (nc and 0xFF))
-                                    samples++
-                                    sx += 6
+                                    if (((nc ushr 24) and 0xFF) >= 250) {
+                                        val hc = heroPx[hRow + hx]
+                                        cost += abs(((hc shr 16) and 0xFF) - ((nc shr 16) and 0xFF)) +
+                                            abs(((hc shr 8) and 0xFF) - ((nc shr 8) and 0xFF)) +
+                                            abs((hc and 0xFF) - (nc and 0xFF))
+                                        samples++
+                                    }
+                                    sx += 5
                                 }
-                                sy += 6
+                                sy += 5
                             }
-                            if (samples > 0 && cost < bestCost) {
+                            if (samples >= 3 && cost < bestCost) {
                                 bestCost = cost
                                 bestDx = dx
                                 bestDy = dy
@@ -397,16 +723,20 @@ object DynamicDepthCodec {
                     // Gate out any block that shows residual skew, parallax shift, or blur mismatch
                     val avgBlockDiff = if (bestSamples > 0) bestCost.toFloat() / (bestSamples * 3f) else Float.MAX_VALUE
                     if (avgBlockDiff <= 12f) {
-                        // Pixel-level strict consistency merge: cleans sensor grain on stationary regions, zero ghosting
                         for (py in by until by + bh) {
-                            val ny = (py + bestDy).coerceIn(0, h - 1)
+                            val ny = py + bestDy
+                            if (ny !in 0 until h) continue
+                            val distY = min(ny, h - 1 - ny).toFloat()
                             val hRow = py * w
                             val nRow = ny * w
                             for (px in bx until bx + bw) {
-                                val nx = (px + bestDx).coerceIn(0, w - 1)
+                                val nx = px + bestDx
+                                if (nx !in 0 until w) continue
+                                val nc = nbPx[nRow + nx]
+                                if (((nc ushr 24) and 0xFF) < 250) continue
+
                                 val idx = hRow + px
                                 val hc = heroPx[idx]
-                                val nc = nbPx[nRow + nx]
                                 val nr = (nc shr 16) and 0xFF
                                 val ng = (nc shr 8) and 0xFF
                                 val nbCol = nc and 0xFF
@@ -415,7 +745,9 @@ object DynamicDepthCodec {
                                     max(abs(((hc shr 8) and 0xFF) - ng), abs((hc and 0xFF) - nbCol))
                                 )
                                 if (diffMax <= 14) {
-                                    val wPix = 1f - (diffMax / 18f)
+                                    val distEdge = min(distY, min(nx, w - 1 - nx).toFloat())
+                                    val borderFade = (distEdge / edgeFeatherPx).coerceIn(0.15f, 1f)
+                                    val wPix = (1f - (diffMax / 18f)) * borderFade * frameScore.coerceIn(0.4f, 1f)
                                     sumR[idx] += nr * wPix
                                     sumG[idx] += ng * wPix
                                     sumB[idx] += nbCol * wPix
@@ -472,9 +804,16 @@ object DynamicDepthCodec {
         val confAccum = FloatArray(w * h)
 
         for (nb in activeNeighbors) {
-            val lumaNb = bitmapToLumaGrid(nb.bitmap, w, h)
+            val (lumaNb, alphaNb) = bitmapToLumaAndAlphaGrid(nb.bitmap, w, h)
             val horizontal = abs(nb.dxRight) >= abs(nb.dyUp)
-            val (disp, conf) = computeAxisDisparity(lumaCenter, lumaNb, w, h, horizontal = horizontal)
+            val (disp, conf) = computeAxisDisparity(
+                lumaA = lumaCenter,
+                lumaB = lumaNb,
+                w = w,
+                h = h,
+                horizontal = horizontal,
+                alphaB = alphaNb
+            )
             val frameWeight = nb.weight.coerceAtLeast(0.15f)
             for (i in dispAccum.indices) {
                 val c = conf[i] * frameWeight
@@ -640,24 +979,56 @@ object DynamicDepthCodec {
         }
     }
 
+    private fun bitmapToLumaAndAlphaGrid(bitmap: Bitmap, w: Int, h: Int): Pair<FloatArray, IntArray> {
+        val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
+        val px = IntArray(w * h)
+        scaled.getPixels(px, 0, w, 0, 0, w, h)
+        if (scaled !== bitmap) scaled.recycle()
+        val luma = FloatArray(w * h)
+        val alpha = IntArray(w * h)
+        for (i in px.indices) {
+            val c = px[i]
+            alpha[i] = (c ushr 24) and 0xFF
+            luma[i] = 0.299f * Color.red(c) + 0.587f * Color.green(c) + 0.114f * Color.blue(c)
+        }
+        return luma to alpha
+    }
+
+    private fun computeEdgeMap(luma: FloatArray, w: Int, h: Int): FloatArray {
+        val edges = FloatArray(w * h)
+        for (y in 1 until h - 1) {
+            val row = y * w
+            val prev = (y - 1) * w
+            val next = (y + 1) * w
+            for (x in 1 until w - 1) {
+                val gx = abs(luma[row + x + 1] - luma[row + x - 1])
+                val gy = abs(luma[next + x] - luma[prev + x])
+                edges[row + x] = min(255f, (gx + gy) * 0.5f)
+            }
+        }
+        return edges
+    }
+
     private fun computeAxisDisparity(
         lumaA: FloatArray,
         lumaB: FloatArray,
         w: Int,
         h: Int,
-        horizontal: Boolean
+        horizontal: Boolean,
+        alphaB: IntArray? = null
     ): Pair<FloatArray, FloatArray> {
         val disp = FloatArray(w * h)
         val conf = FloatArray(w * h)
         val maxShift = 12
         val block = 2
-        val minY = if (horizontal) block else maxShift + block
-        val maxY = if (horizontal) h - block else h - maxShift - block
-        val minX = if (horizontal) maxShift + block else block
-        val maxX = if (horizontal) w - maxShift - block else w - block
+        val minY = block
+        val maxY = h - block
+        val minX = block
+        val maxX = w - block
 
         for (y in minY until maxY) {
             for (x in minX until maxX) {
+                if (alphaB != null && alphaB[y * w + x] < 240) continue
                 // Measure local texture contrast so flat/smooth stationary surfaces don't invent bumpy noise
                 var lumaSum = 0f
                 for (by in -block..block) {
@@ -677,22 +1048,32 @@ object DynamicDepthCodec {
                 var bestShift = 0
                 var bestSad = Float.MAX_VALUE
                 var secondSad = Float.MAX_VALUE
-                for (s in -maxShift..maxShift) {
+                val sMin = if (horizontal) -min(maxShift, x - block) else -min(maxShift, y - block)
+                val sMax = if (horizontal) min(maxShift, w - 1 - block - x) else min(maxShift, h - 1 - block - y)
+                if (sMax <= sMin) continue
+
+                for (s in sMin..sMax) {
                     var sad = 0f
+                    var validCount = 0
                     for (by in -block..block) {
                         val rowA = (y + by) * w
                         val rowB = if (horizontal) (y + by) * w else (y + by + s) * w
                         val xShift = if (horizontal) s else 0
                         for (bx in -block..block) {
-                            sad += abs(lumaA[rowA + x + bx] - lumaB[rowB + x + bx + xShift])
+                            val bIdx = rowB + x + bx + xShift
+                            if (alphaB != null && alphaB[bIdx] < 240) continue
+                            sad += abs(lumaA[rowA + x + bx] - lumaB[bIdx])
+                            validCount++
                         }
                     }
-                    if (sad < bestSad) {
+                    if (validCount < 18) continue
+                    val normSad = sad * (25f / validCount)
+                    if (normSad < bestSad) {
                         secondSad = bestSad
-                        bestSad = sad
+                        bestSad = normSad
                         bestShift = s
-                    } else if (sad < secondSad) {
-                        secondSad = sad
+                    } else if (normSad < secondSad) {
+                        secondSad = normSad
                     }
                 }
                 val idx = y * w + x
@@ -746,36 +1127,96 @@ object DynamicDepthCodec {
     }
 
     private fun fillDepthHoles(rawMeters: FloatArray, w: Int, h: Int, fallbackFar: Float): FloatArray {
-        val out = rawMeters.copyOf()
-        // Horizontal forward + backward pass
+        val size = w * h
+        val leftVal = FloatArray(size)
+        val leftDist = IntArray(size) { Int.MAX_VALUE }
+        val rightVal = FloatArray(size)
+        val rightDist = IntArray(size) { Int.MAX_VALUE }
+        val topVal = FloatArray(size)
+        val topDist = IntArray(size) { Int.MAX_VALUE }
+        val botVal = FloatArray(size)
+        val botDist = IntArray(size) { Int.MAX_VALUE }
+
         for (y in 0 until h) {
-            var lastValid = 0f
+            var last = 0f
+            var d = Int.MAX_VALUE
+            val row = y * w
             for (x in 0 until w) {
-                val idx = y * w + x
-                if (out[idx] > 0f) lastValid = out[idx] else if (lastValid > 0f) out[idx] = lastValid
+                val idx = row + x
+                val v = rawMeters[idx]
+                if (v > 0f) {
+                    last = v; d = 0
+                } else if (d < Int.MAX_VALUE) {
+                    d++
+                }
+                leftVal[idx] = last
+                leftDist[idx] = d
             }
-            lastValid = 0f
+            last = 0f
+            d = Int.MAX_VALUE
             for (x in w - 1 downTo 0) {
-                val idx = y * w + x
-                if (out[idx] > 0f) lastValid = out[idx] else if (lastValid > 0f) out[idx] = lastValid
+                val idx = row + x
+                val v = rawMeters[idx]
+                if (v > 0f) {
+                    last = v; d = 0
+                } else if (d < Int.MAX_VALUE) {
+                    d++
+                }
+                rightVal[idx] = last
+                rightDist[idx] = d
             }
         }
-        // Vertical pass + fallback
+
         for (x in 0 until w) {
-            var lastValid = 0f
+            var last = 0f
+            var d = Int.MAX_VALUE
             for (y in 0 until h) {
                 val idx = y * w + x
-                if (out[idx] > 0f) lastValid = out[idx] else if (lastValid > 0f) out[idx] = lastValid
+                val v = rawMeters[idx]
+                if (v > 0f) {
+                    last = v; d = 0
+                } else if (d < Int.MAX_VALUE) {
+                    d++
+                }
+                topVal[idx] = last
+                topDist[idx] = d
             }
-            lastValid = 0f
+            last = 0f
+            d = Int.MAX_VALUE
             for (y in h - 1 downTo 0) {
                 val idx = y * w + x
-                if (out[idx] > 0f) {
-                    lastValid = out[idx]
-                } else {
-                    out[idx] = if (lastValid > 0f) lastValid else fallbackFar
+                val v = rawMeters[idx]
+                if (v > 0f) {
+                    last = v; d = 0
+                } else if (d < Int.MAX_VALUE) {
+                    d++
                 }
+                botVal[idx] = last
+                botDist[idx] = d
             }
+        }
+
+        val out = FloatArray(size)
+        for (i in 0 until size) {
+            if (rawMeters[i] > 0f) {
+                out[i] = rawMeters[i]
+                continue
+            }
+            var wSum = 0f
+            var vSum = 0f
+            if (leftVal[i] > 0f) {
+                val wt = 1f / (leftDist[i] + 1f); wSum += wt; vSum += leftVal[i] * wt
+            }
+            if (rightVal[i] > 0f) {
+                val wt = 1f / (rightDist[i] + 1f); wSum += wt; vSum += rightVal[i] * wt
+            }
+            if (topVal[i] > 0f) {
+                val wt = 1f / (topDist[i] + 1f); wSum += wt; vSum += topVal[i] * wt
+            }
+            if (botVal[i] > 0f) {
+                val wt = 1f / (botDist[i] + 1f); wSum += wt; vSum += botVal[i] * wt
+            }
+            out[i] = if (wSum > 0f) vSum / wSum else fallbackFar
         }
         return out
     }

@@ -116,7 +116,7 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
             colorTexId = texIds[0]
             depthTexId = texIds[1]
 
-            buildGridMesh(cols = 96, rows = 128)
+            buildGridMesh(cols = 112, rows = 148)
         }
 
         override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -160,7 +160,7 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
                 scaleY = 1.0f
             }
             // Overscan keeps edge-pinning zone cleanly outside the visible viewport so edges don't warp
-            val overscan = if (hasDepthMap) 1.13f else 1.0f
+            val overscan = if (hasDepthMap) 1.16f else 1.0f
             GLES20.glUniform2f(uScaleLoc, scaleX * overscan, scaleY * overscan)
             GLES20.glUniform2f(uTiltLoc, currentTiltX, currentTiltY)
             GLES20.glUniform1f(uHasDepthLoc, if (hasDepthMap) 1.0f else 0.0f)
@@ -280,18 +280,16 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
                 void main() {
                     vTexCoord = aTexCoord;
                     float d = (uHasDepth > 0.5) ? texture2D(uDepthTex, aTexCoord).r : 0.0;
-                    // Smoothly anchor outer borders outside visible overscan so corners never crease or gap
-                    float edgeX = smoothstep(0.0, 0.11, aTexCoord.x) * smoothstep(1.0, 0.89, aTexCoord.x);
-                    float edgeY = smoothstep(0.0, 0.11, aTexCoord.y) * smoothstep(1.0, 0.89, aTexCoord.y);
+                    // Smooth monotonic border anchor (0..6%) keeps max compression < 1.0 so foreground edges never fold
+                    float edgeX = smoothstep(0.0, 0.060, aTexCoord.x) * smoothstep(1.0, 0.940, aTexCoord.x);
+                    float edgeY = smoothstep(0.0, 0.060, aTexCoord.y) * smoothstep(1.0, 0.940, aTexCoord.y);
                     float edgePin = min(edgeX, edgeY);
 
-                    float parallaxAmp = 0.118 * uHasDepth * edgePin;
-                    float centeredDepth = d - 0.35;
+                    float parallaxAmp = 0.175 * uHasDepth * edgePin;
+                    float centeredDepth = d - 0.36;
                     vec2 offset = vec2(uTilt.x, -uTilt.y) * centeredDepth * parallaxAmp;
 
-                    // Subtle foreground perspective scale pop
-                    float popScale = 1.0 + centeredDepth * 0.024 * uHasDepth * edgePin;
-                    vec2 pos = (aPosition * popScale + offset) * uAspectScale;
+                    vec2 pos = (aPosition + offset) * uAspectScale;
                     float zOrder = (uHasDepth > 0.5) ? (1.0 - d) * 0.8 : 0.0;
                     gl_Position = vec4(pos, zOrder, 1.0);
                 }

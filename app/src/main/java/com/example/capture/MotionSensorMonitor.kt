@@ -12,9 +12,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.asin
-import kotlin.math.atan2
 import kotlin.math.hypot
+import kotlin.math.pow
+import kotlin.math.sign
 import kotlin.math.sqrt
 
 data class MotionSample(
@@ -25,6 +27,7 @@ data class MotionSample(
     val rollDeg: Float = 0f,
     val aimYawDeg: Float = 0f,
     val aimUpDeg: Float = 0f,
+    val rollRightDeg: Float = 0f,
     val normTiltX: Float = 0f,
     val normTiltY: Float = 0f,
     val tiltOffsetX: Float = 0f,
@@ -93,6 +96,7 @@ class MotionSensorMonitor(context: Context) : SensorEventListener {
         _motion.value = _motion.value.copy(
             aimYawDeg = 0f,
             aimUpDeg = 0f,
+            rollRightDeg = 0f,
             normTiltX = 0f,
             normTiltY = 0f,
             tiltOffsetX = 0f,
@@ -194,13 +198,14 @@ class MotionSensorMonitor(context: Context) : SensorEventListener {
                 val aimUpDeg = -faceUpDeg
 
                 // 3D Viewer / Review diorama parallax (zero gimbal lock at vertical, matches drag polarity):
-                // Tilt screen right/roll right -> targetX > 0 (foreground shifts right)
-                // Tilt screen face toward ceiling (top pushed away) -> targetY < 0 -> foreground shifts up
-                val targetX = ((faceRightDeg + rollRightDeg * 0.7f) / 8.5f).coerceIn(-1f, 1f)
-                val targetY = (-faceUpDeg / 8.5f).coerceIn(-1f, 1f)
+                // Responsive non-linear curve reaches vivid depth under natural 2°-4.5° wrist tilts
+                val rawTiltX = ((faceRightDeg + rollRightDeg * 0.75f) / 4.5f).coerceIn(-1f, 1f)
+                val rawTiltY = (-faceUpDeg / 4.5f).coerceIn(-1f, 1f)
+                val targetX = sign(rawTiltX) * abs(rawTiltX).pow(0.72f)
+                val targetY = sign(rawTiltY) * abs(rawTiltY).pow(0.72f)
 
-                smoothedTiltX += (targetX - smoothedTiltX) * 0.30f
-                smoothedTiltY += (targetY - smoothedTiltY) * 0.30f
+                smoothedTiltX += (targetX - smoothedTiltX) * 0.34f
+                smoothedTiltY += (targetY - smoothedTiltY) * 0.34f
 
                 // Sensitive Tilt Meter: ±5.5° reaches full edge; inner sweet-spot ring (58% radius) = ±3.2°
                 val meterTargetX = ((rollRightDeg * 0.90f - faceRightDeg * 0.55f) / 5.5f).coerceIn(-1f, 1f)
@@ -208,7 +213,7 @@ class MotionSensorMonitor(context: Context) : SensorEventListener {
                 smoothedMeterX += (meterTargetX - smoothedMeterX) * 0.40f
                 smoothedMeterY += (meterTargetY - smoothedMeterY) * 0.40f
 
-                val rollDevDeg = kotlin.math.abs(rollRightDeg)
+                val rollDevDeg = abs(rollRightDeg)
                 val totalTiltDevDeg = hypot(
                     hypot(faceUpDeg, rollRightDeg),
                     faceRightDeg * 0.85f
@@ -220,6 +225,7 @@ class MotionSensorMonitor(context: Context) : SensorEventListener {
                     rollDeg = roll,
                     aimYawDeg = aimRightDeg,
                     aimUpDeg = aimUpDeg,
+                    rollRightDeg = rollRightDeg,
                     normTiltX = smoothedTiltX,
                     normTiltY = smoothedTiltY,
                     tiltOffsetX = smoothedMeterX,

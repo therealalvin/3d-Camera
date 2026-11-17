@@ -7,13 +7,26 @@ import android.hardware.camera2.CameraManager
 import android.hardware.display.DisplayManager
 import android.view.Display
 import android.view.Surface
+import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.acos
+import kotlin.math.asin
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 data class Depth16Buffer(
     val millimeters: ShortArray,
     val width: Int,
     val height: Int
+)
+
+data class RelativeFramePose(
+    val relYawDeg: Float,    // Frame aimed Right (+) relative to Hero
+    val relPitchDeg: Float,  // Frame aimed Up (+) relative to Hero
+    val relRollDeg: Float,   // Frame rolled CW (+) relative to Hero
+    val totalAngleDeg: Float
 )
 
 object SmartCaptureHelpers {
@@ -123,10 +136,74 @@ object SmartCaptureHelpers {
         bqx: Float, bqy: Float, bqz: Float, bqw: Float
     ): Float {
         val dot = (aqx * bqx + aqy * bqy + aqz * bqz + aqw * bqw)
-            .let { kotlin.math.abs(it) }
+            .let { abs(it) }
             .coerceIn(0f, 1f)
         val rad = 2f * acos(dot)
-        return rad * 180f / kotlin.math.PI.toFloat()
+        return rad * 180f / PI.toFloat()
+    }
+
+    /**
+     * Computes gimbal-lock-free relative yaw (pan right), pitch (tilt up), and in-plane roll (CW)
+     * of a neighbor frame with respect to the Hero frame's optical basis.
+     */
+    fun computeRelativePoseToHero(
+        heroQx: Float, heroQy: Float, heroQz: Float, heroQw: Float,
+        frameQx: Float, frameQy: Float, frameQz: Float, frameQw: Float,
+        heroAimYawDeg: Float = 0f,
+        heroAimUpDeg: Float = 0f,
+        heroRollRightDeg: Float = 0f,
+        frameAimYawDeg: Float = 0f,
+        frameAimUpDeg: Float = 0f,
+        frameRollRightDeg: Float = 0f
+    ): RelativeFramePose {
+        val hasHeroQ = (heroQx * heroQx + heroQy * heroQy + heroQz * heroQz + heroQw * heroQw) > 0.25f
+        val hasFrameQ = (frameQx * frameQx + frameQy * frameQy + frameQz * frameQz + frameQw * frameQw) > 0.25f
+        val heroIdentityOnly = heroQx == 0f && heroQy == 0f && heroQz == 0f && heroQw == 1f &&
+            frameQx == 0f && frameQy == 0f && frameQz == 0f && frameQw == 1f
+
+        if (hasHeroQ && hasFrameQ && !heroIdentityOnly) {
+            // Hero orthonormal camera basis (Right, Up, Forward = -ScreenNormal)
+            val hRx = 1f - 2f * (heroQy * heroQy + heroQz * heroQz)
+            val hRy = 2f * (heroQx * heroQy + heroQw * heroQz)
+            val hRz = 2f * (heroQx * heroQz - heroQw * heroQy)
+
+            val hUx = 2f * (heroQx * heroQy - heroQw * heroQz)
+            val hUy = 1f - 2f * (heroQx * heroQx + heroQz * heroQz)
+            val hUz = 2f * (heroQy * heroQz + heroQw * heroQx)
+
+            val hFx = -2f * (heroQx * heroQz + heroQw * heroQy)
+            val hFy = -2f * (heroQy * heroQz - heroQw * heroQx)
+            val hFz = -(1f - 2f * (heroQx * heroQx + heroQy * heroQy))
+
+            // Frame orthonormal camera basis
+            val fUx = 2f * (frameQx * frameQy - frameQw * frameQz)
+            val fUy = 1f - 2f * (frameQx * frameQx + frameQz * frameQz)
+            val fUz = 2f * (frameQy * frameQz + frameQw * frameQx)
+
+            val fFx = -2f * (frameQx * frameQz + frameQw * frameQy)
+            val fFy = -2f * (frameQy * frameQz - frameQw * frameQx)
+            val fFz = -(1f - 2f * (frameQx * frameQx + frameQy * frameQy))
+
+            val fwdDotRight = (fFx * hRx + fFy * hRy + fFz * hRz)
+            val fwdDotUp = (fFx * hUx + fFy * hUy + fFz * hUz)
+            val fwdDotFwd = (fFx * hFx + fFy * hFy + fFz * hFz).coerceAtLeast(1e-4f)
+
+            val upDotRight = fUx * hRx + fUy * hRy + fUz * hRz
+            val upDotUp = fUx * hUx + fUy * hUy + fUz * hUz
+
+            val radToDeg = 180f / PI.toFloat()
+            val relYaw = atan2(fwdDotRight, fwdDotFwd) * radToDeg
+            val relPitch = atan2(fwdDotUp, fwdDotFwd) * radToDeg
+            val relRoll = atan2(upDotRight, upDotUp) * radToDeg
+            val total = quaternionAngleDegrees(heroQx, heroQy, heroQz, heroQw, frameQx, frameQy, frameQz, frameQw)
+            return RelativeFramePose(relYaw, relPitch, relRoll, total)
+        }
+
+        val dYaw = MotionSensorMonitor.wrapAngleDelta(frameAimYawDeg, heroAimYawDeg)
+        val dPitch = MotionSensorMonitor.wrapAngleDelta(frameAimUpDeg, heroAimUpDeg)
+        val dRoll = MotionSensorMonitor.wrapAngleDelta(frameRollRightDeg, heroRollRightDeg)
+        val total = sqrt(dYaw * dYaw + dPitch * dPitch + dRoll * dRoll)
+        return RelativeFramePose(dYaw, dPitch, dRoll, total)
     }
 
     /**

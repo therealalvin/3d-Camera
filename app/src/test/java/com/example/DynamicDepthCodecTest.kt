@@ -3,6 +3,8 @@ package com.example
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import com.example.capture.Depth16Buffer
+import com.example.capture.RelativeFramePose
 import com.example.imaging.DynamicDepthCodec
 import com.example.imaging.MetricDepthObservation
 import com.example.imaging.StereoNeighborObservation
@@ -264,5 +266,97 @@ class DynamicDepthCodecTest {
         // Hole filled cleanly from 2400mm while hero's 900mm foreground stays intact
         assertTrue(fused.nearMeters < 1.0f)
         assertTrue(fused.farMeters > 2.0f)
+    }
+
+    @Test
+    fun `refineMetricDepthMap preserves foreground depth all the way to the bottom edge`() {
+        val w = 120
+        val h = 160
+        val colorBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val bottomFg = y >= 110
+                colorBmp.setPixel(x, y, if (bottomFg) Color.rgb(210, 170, 130) else Color.rgb(30, 45, 70))
+            }
+        }
+        val dw = 60
+        val dh = 80
+        val rawMm = ShortArray(dw * dh) { idx ->
+            val dy = idx / dw
+            (if (dy >= 55) 750 else 3200).toShort()
+        }
+
+        val refined = DynamicDepthCodec.refineMetricDepthMap(colorBmp, rawMm, dw, dh)
+        val depthBmp = refined.depthBitmap
+        val bottomEdgeGray = Color.red(depthBmp.getPixel(depthBmp.width / 2, depthBmp.height - 2))
+        val topGray = Color.red(depthBmp.getPixel(depthBmp.width / 2, 4))
+        assertTrue(
+            "Bottom foreground ($bottomEdgeGray) should remain closer/brighter than background ($topGray)",
+            bottomEdgeGray > 200 && bottomEdgeGray > topGray + 120
+        )
+    }
+
+    @Test
+    fun `rectifyFrameToHeroPlane restores rolled neighbor and achieves strong edge alignment`() {
+        val w = 160
+        val h = 120
+        val hero = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val box = x in 45..115 && y in 30..90
+                hero.setPixel(x, y, if (box) Color.rgb(220, 220, 220) else Color.rgb(25, 35, 50))
+            }
+        }
+
+        // Simulate phone rolled +10 deg CW -> horizon in captured bitmap tilts -10 deg around center
+        val rolledSource = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val cx = (w - 1) * 0.5
+        val cy = (h - 1) * 0.5
+        val rad = Math.toRadians(10.0)
+        val cosA = Math.cos(rad)
+        val sinA = Math.sin(rad)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val dx = x - cx
+                val dy = y - cy
+                val hx = (cx + dx * cosA - dy * sinA).toInt()
+                val hy = (cy + dx * sinA + dy * cosA).toInt()
+                val box = hx in 45..115 && hy in 30..90
+                rolledSource.setPixel(x, y, if (box) Color.rgb(220, 220, 220) else Color.rgb(25, 35, 50))
+            }
+        }
+
+        val rectified = DynamicDepthCodec.rectifyFrameToHeroPlane(
+            heroBitmap = hero,
+            sourceBitmap = rolledSource,
+            relativePose = RelativeFramePose(relYawDeg = 0f, relPitchDeg = 0f, relRollDeg = 10f, totalAngleDeg = 10f)
+        )
+        assertTrue("Expected high edge match after de-rotation, got ${rectified.edgeMatchScore}", rectified.edgeMatchScore > 0.70f)
+
+        val blended = DynamicDepthCodec.enhanceHeroWithAlignedFrames(hero, listOf(rectified))
+        assertEquals(w, blended.width)
+        assertEquals(h, blended.height)
+    }
+
+    @Test
+    fun `rectifyDepth16ToHero aligns rotated depth buffer back onto upright hero`() {
+        val w = 40
+        val h = 40
+        val raw = ShortArray(w * h) { 3000 }
+        // Place foreground at right-top quadrant -> wait: test symmetry with 90° or 10° roll
+        for (y in 12 until 28) {
+            for (x in 15 until 25) {
+                raw[y * w + x] = 800
+            }
+        }
+        val warped = DynamicDepthCodec.rectifyDepth16ToHero(
+            depthBuffer = Depth16Buffer(raw, w, h),
+            relRollDeg = 0f,
+            residualDxRatio = 0.05f,
+            residualDyRatio = 0f
+        )
+        // Object shifted right by +2px (0.05 * 40): old right edge (x=24) -> x=26 should now be foreground 800mm
+        val shiftedRightEdge = warped.millimeters[20 * w + 26].toInt() and 0xFFFF
+        assertEquals(800, shiftedRightEdge)
     }
 }

@@ -163,8 +163,8 @@ fun ReviewPhotoScreen(
                     }
                 ) { change, dragAmount ->
                     change.consume()
-                    dragOffsetX = (dragOffsetX + dragAmount.x / 200f).coerceIn(-1f, 1f)
-                    dragOffsetY = (dragOffsetY + dragAmount.y / 200f).coerceIn(-1f, 1f)
+                    dragOffsetX = (dragOffsetX + dragAmount.x / 145f).coerceIn(-1f, 1f)
+                    dragOffsetY = (dragOffsetY + dragAmount.y / 145f).coerceIn(-1f, 1f)
                 }
             }
     ) {

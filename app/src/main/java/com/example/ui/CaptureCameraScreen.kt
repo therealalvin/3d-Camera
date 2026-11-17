@@ -5,17 +5,20 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -24,6 +27,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -41,13 +45,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.CameraAlt
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Collections
 import androidx.compose.material.icons.rounded.Smartphone
-import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -67,8 +73,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -92,8 +98,12 @@ import coil.compose.AsyncImage
 import com.example.R
 import com.example.capture.CameraPreviewHost
 import com.example.capture.CapturePhase
+import com.example.capture.CaptureQualityTier
 import com.example.capture.CaptureViewModel
+import com.example.ui.theme.ErrorCrimson
 import com.example.ui.theme.ObsidianBackground
+import com.example.ui.theme.QualityEmerald
+import com.example.ui.theme.QualityGreen
 import com.example.ui.theme.SpatialMint
 import com.example.ui.theme.WarmAmber
 import java.io.File
@@ -177,8 +187,10 @@ fun CaptureCameraScreen(
         }
     }
 
-    LaunchedEffect(uiState.clearedTilesCount) {
-        if (uiState.clearedTilesCount > 0) {
+    LaunchedEffect(uiState.qualityTier, uiState.phase) {
+        if (uiState.phase == CapturePhase.SWEEPING &&
+            (uiState.qualityTier == CaptureQualityTier.GOOD || uiState.qualityTier == CaptureQualityTier.EXCELLENT)
+        ) {
             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
         }
     }
@@ -219,7 +231,7 @@ fun CaptureCameraScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxHeight()
-                        .width(160.dp)
+                        .width(176.dp)
                         .align(Alignment.CenterEnd)
                         .background(
                             Brush.horizontalGradient(
@@ -231,7 +243,7 @@ fun CaptureCameraScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(210.dp)
+                        .height(230.dp)
                         .align(Alignment.BottomCenter)
                         .background(
                             Brush.verticalGradient(
@@ -246,16 +258,11 @@ fun CaptureCameraScreen(
                 uiState.phase == CapturePhase.PROCESSING -> stringResource(R.string.capture_processing)
                 uiState.phase == CapturePhase.SWEEPING && uiState.isMovingTooFast ->
                     stringResource(R.string.capture_guide_steady)
-                uiState.phase == CapturePhase.SWEEPING && uiState.isTiltOffLevel ->
-                    stringResource(R.string.capture_guide_keep_tilt)
                 uiState.phase == CapturePhase.SWEEPING ->
                     stringResource(R.string.capture_guide_sweep)
                 else -> stringResource(R.string.capture_guide_ready)
             }
-            val pillAccent = if (
-                uiState.phase == CapturePhase.SWEEPING &&
-                (uiState.isMovingTooFast || uiState.isTiltOffLevel)
-            ) {
+            val pillAccent = if (uiState.phase == CapturePhase.SWEEPING && uiState.isMovingTooFast) {
                 WarmAmber
             } else {
                 SpatialMint
@@ -310,7 +317,7 @@ fun CaptureCameraScreen(
                 }
             }
 
-            // Chalkboard-Erase 4x4 Detail Coverage Overlay while SWEEPING
+            // Soft Coverage Overlay while SWEEPING
             AnimatedVisibility(
                 visible = uiState.phase == CapturePhase.SWEEPING,
                 enter = fadeIn(),
@@ -320,30 +327,30 @@ fun CaptureCameraScreen(
                     .safeDrawingPadding()
                     .padding(
                         start = 24.dp,
-                        end = if (isLandscape) 128.dp else 24.dp,
-                        top = if (isLandscape) 76.dp else 92.dp,
-                        bottom = if (isLandscape) 76.dp else 184.dp
+                        end = if (isLandscape) 156.dp else 24.dp,
+                        top = if (isLandscape) 72.dp else 88.dp,
+                        bottom = if (isLandscape) 88.dp else 210.dp
                     )
             ) {
                 DetailCoverageOverlay(
                     tileDetails = uiState.tileDetails,
                     brushX = uiState.brushX,
                     brushY = uiState.brushY,
-                    isWarning = uiState.isMovingTooFast || uiState.isTiltOffLevel
+                    isWarning = uiState.isMovingTooFast
                 )
             }
 
-            // Bottom Hint / Detail Progress Pill
+            // Bottom Hint / Red-to-Green Quality Indicator Bar
             val guideModifier = if (isLandscape) {
                 Modifier
                     .align(Alignment.BottomCenter)
                     .safeDrawingPadding()
-                    .padding(bottom = 22.dp, end = 96.dp)
+                    .padding(bottom = 18.dp, start = 16.dp, end = 148.dp)
             } else {
                 Modifier
                     .align(Alignment.BottomCenter)
                     .safeDrawingPadding()
-                    .padding(bottom = 128.dp)
+                    .padding(bottom = 114.dp, start = 16.dp, end = 16.dp)
             }
 
             AnimatedVisibility(
@@ -361,23 +368,14 @@ fun CaptureCameraScreen(
                 exit = fadeOut(),
                 modifier = guideModifier
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.padding(horizontal = 12.dp)
-                ) {
-                    DetailProgressPill(
-                        detailPercent = uiState.detailPercent,
-                        clearedTiles = uiState.clearedTilesCount,
-                        totalTiles = CaptureViewModel.TILE_COUNT,
-                        isWarning = uiState.isMovingTooFast
-                    )
-                    TiltLevelMeterPill(
-                        tiltX = uiState.tiltMeterX,
-                        tiltY = uiState.tiltMeterY,
-                        isOffLevel = uiState.isTiltOffLevel
-                    )
-                }
+                CaptureQualityMeterRow(
+                    qualityScore = uiState.qualityScore,
+                    qualityTier = uiState.qualityTier,
+                    frameCount = uiState.capturedFrameCount,
+                    tiltX = uiState.tiltMeterX,
+                    tiltY = uiState.tiltMeterY,
+                    isTiltOffLevel = uiState.isTiltOffLevel
+                )
             }
 
             // Adaptive Studio Controls: Bottom Bar in Portrait, Right Rail in Landscape
@@ -387,24 +385,47 @@ fun CaptureCameraScreen(
                         .fillMaxHeight()
                         .align(Alignment.CenterEnd)
                         .safeDrawingPadding()
-                        .padding(end = 20.dp, top = 24.dp, bottom = 24.dp)
+                        .padding(end = 18.dp, top = 20.dp, bottom = 20.dp)
                 ) {
-                    ShutterCaptureButton(
-                        phase = uiState.phase,
-                        onClick = { viewModel.onShutterPressed(onCaptureReadyForReview = onCaptureReadyForReview) },
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .testTag("shutter_button")
-                    )
+                    if (uiState.phase == CapturePhase.SWEEPING) {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.align(Alignment.Center)
+                        ) {
+                            AcceptCaptureButton(
+                                enabled = uiState.canAcceptCapture,
+                                qualityScore = uiState.qualityScore,
+                                onClick = {
+                                    viewModel.onAcceptCapturePressed(onCaptureReadyForReview = onCaptureReadyForReview)
+                                },
+                                modifier = Modifier.testTag("accept_capture_button")
+                            )
+                            CancelCaptureButton(
+                                onClick = viewModel::onCancelCapturePressed,
+                                modifier = Modifier.testTag("cancel_capture_button")
+                            )
+                        }
+                    } else {
+                        ShutterCaptureButton(
+                            phase = uiState.phase,
+                            onClick = {
+                                viewModel.onShutterPressed(onCaptureReadyForReview = onCaptureReadyForReview)
+                            },
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .testTag("shutter_button")
+                        )
 
-                    GalleryThumbnailButton(
-                        latestThumbPath = latestThumb,
-                        enabled = uiState.phase != CapturePhase.PROCESSING,
-                        onClick = onOpenGallery,
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .testTag("gallery_thumbnail_button")
-                    )
+                        GalleryThumbnailButton(
+                            latestThumbPath = latestThumb,
+                            enabled = uiState.phase != CapturePhase.PROCESSING,
+                            onClick = onOpenGallery,
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .testTag("gallery_thumbnail_button")
+                        )
+                    }
                 }
             } else {
                 Box(
@@ -412,24 +433,52 @@ fun CaptureCameraScreen(
                         .fillMaxWidth()
                         .align(Alignment.BottomCenter)
                         .safeDrawingPadding()
-                        .padding(horizontal = 28.dp, vertical = 24.dp)
+                        .padding(horizontal = 24.dp, vertical = 20.dp)
                 ) {
-                    GalleryThumbnailButton(
-                        latestThumbPath = latestThumb,
-                        enabled = uiState.phase != CapturePhase.PROCESSING,
-                        onClick = onOpenGallery,
-                        modifier = Modifier
-                            .align(Alignment.CenterStart)
-                            .testTag("gallery_thumbnail_button")
-                    )
+                    if (uiState.phase == CapturePhase.SWEEPING) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterHorizontally),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .widthIn(max = 420.dp)
+                                .align(Alignment.Center)
+                        ) {
+                            CancelCaptureButton(
+                                onClick = viewModel::onCancelCapturePressed,
+                                modifier = Modifier.testTag("cancel_capture_button")
+                            )
+                            AcceptCaptureButton(
+                                enabled = uiState.canAcceptCapture,
+                                qualityScore = uiState.qualityScore,
+                                onClick = {
+                                    viewModel.onAcceptCapturePressed(onCaptureReadyForReview = onCaptureReadyForReview)
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("accept_capture_button")
+                            )
+                        }
+                    } else {
+                        GalleryThumbnailButton(
+                            latestThumbPath = latestThumb,
+                            enabled = uiState.phase != CapturePhase.PROCESSING,
+                            onClick = onOpenGallery,
+                            modifier = Modifier
+                                .align(Alignment.CenterStart)
+                                .testTag("gallery_thumbnail_button")
+                        )
 
-                    ShutterCaptureButton(
-                        phase = uiState.phase,
-                        onClick = { viewModel.onShutterPressed(onCaptureReadyForReview = onCaptureReadyForReview) },
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .testTag("shutter_button")
-                    )
+                        ShutterCaptureButton(
+                            phase = uiState.phase,
+                            onClick = {
+                                viewModel.onShutterPressed(onCaptureReadyForReview = onCaptureReadyForReview)
+                            },
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .testTag("shutter_button")
+                        )
+                    }
                 }
             }
 
@@ -581,7 +630,7 @@ private fun ShutterCaptureButton(
             .clip(CircleShape)
             .border(
                 width = 4.dp,
-                color = if (phase == CapturePhase.SWEEPING) SpatialMint else MaterialTheme.colorScheme.onBackground,
+                color = MaterialTheme.colorScheme.onBackground,
                 shape = CircleShape
             )
             .clickable(enabled = phase != CapturePhase.PROCESSING, onClick = onClick)
@@ -591,18 +640,83 @@ private fun ShutterCaptureButton(
             modifier = Modifier
                 .size(innerSize)
                 .clip(RoundedCornerShape(innerCorner))
-                .background(
-                    if (phase == CapturePhase.SWEEPING) SpatialMint else MaterialTheme.colorScheme.onBackground
-                )
+                .background(MaterialTheme.colorScheme.onBackground)
         ) {
-            if (phase == CapturePhase.SWEEPING) {
-                Icon(
-                    imageVector = Icons.Rounded.Stop,
-                    contentDescription = stringResource(R.string.cd_shutter_stop),
-                    tint = MaterialTheme.colorScheme.onPrimary,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
+            Icon(
+                imageVector = Icons.Rounded.CameraAlt,
+                contentDescription = stringResource(R.string.cd_shutter_start),
+                tint = MaterialTheme.colorScheme.surface,
+                modifier = Modifier.size(22.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun AcceptCaptureButton(
+    enabled: Boolean,
+    qualityScore: Float,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val targetBg = when {
+        !enabled -> MaterialTheme.colorScheme.surfaceVariant
+        qualityScore >= 0.62f -> QualityGreen
+        else -> SpatialMint
+    }
+    val containerColor by animateColorAsState(targetValue = targetBg, label = "acceptBgColor")
+    val contentColor = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(50),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = containerColor,
+            contentColor = contentColor,
+            disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+            disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant
+        ),
+        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
+        modifier = modifier
+            .height(54.dp)
+            .minimumInteractiveComponentSize()
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.Check,
+            contentDescription = stringResource(R.string.cd_accept_capture),
+            modifier = Modifier.size(22.dp)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = stringResource(R.string.capture_accept_button),
+            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+        )
+    }
+}
+
+@Composable
+private fun CancelCaptureButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+        border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.outline),
+        modifier = modifier
+            .size(54.dp)
+            .minimumInteractiveComponentSize()
+            .clip(CircleShape)
+            .clickable(onClick = onClick)
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Icon(
+                imageVector = Icons.Rounded.Close,
+                contentDescription = stringResource(R.string.cd_cancel_capture),
+                tint = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.size(24.dp)
+            )
         }
     }
 }
@@ -753,40 +867,126 @@ private fun DetailCoverageOverlay(
     }
 }
 
+private fun qualityGradientColor(score: Float): Color {
+    val s = score.coerceIn(0f, 1f)
+    return when {
+        s < 0.40f -> lerp(ErrorCrimson, WarmAmber, s / 0.40f)
+        s < 0.72f -> lerp(WarmAmber, QualityGreen, (s - 0.40f) / 0.32f)
+        else -> lerp(QualityGreen, QualityEmerald, (s - 0.72f) / 0.28f)
+    }
+}
+
 @Composable
-private fun DetailProgressPill(
-    detailPercent: Int,
-    clearedTiles: Int,
-    totalTiles: Int,
-    isWarning: Boolean,
+private fun CaptureQualityMeterRow(
+    qualityScore: Float,
+    qualityTier: CaptureQualityTier,
+    frameCount: Int,
+    tiltX: Float,
+    tiltY: Float,
+    isTiltOffLevel: Boolean,
     modifier: Modifier = Modifier
 ) {
-    val activeColor = if (isWarning) WarmAmber else SpatialMint
-
-    Surface(
-        shape = RoundedCornerShape(50),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.86f),
-        modifier = modifier
-            .border(1.dp, activeColor.copy(alpha = 0.5f), RoundedCornerShape(50))
-            .testTag("detail_progress_pill")
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp)
-        ) {
-            Icon(
-                imageVector = Icons.Rounded.AutoAwesome,
-                contentDescription = null,
-                tint = activeColor,
-                modifier = Modifier.size(16.dp)
-            )
-            Text(
-                text = stringResource(R.string.capture_step_progress, detailPercent, clearedTiles, totalTiles),
-                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
-                color = MaterialTheme.colorScheme.onSurface
-            )
+    val animatedScore by animateFloatAsState(
+        targetValue = qualityScore.coerceIn(0f, 1f),
+        animationSpec = tween(durationMillis = 180),
+        label = "qualityBarFill"
+    )
+    val qualityColor by animateColorAsState(
+        targetValue = qualityGradientColor(qualityScore),
+        label = "qualityBarColor"
+    )
+    val tierLabel = stringResource(
+        when (qualityTier) {
+            CaptureQualityTier.POOR -> R.string.capture_quality_poor
+            CaptureQualityTier.FAIR -> R.string.capture_quality_fair
+            CaptureQualityTier.GOOD -> R.string.capture_quality_good
+            CaptureQualityTier.EXCELLENT -> R.string.capture_quality_excellent
         }
+    )
+    val percent = (qualityScore * 100f).roundToInt().coerceIn(0, 100)
+    val summaryText = stringResource(R.string.capture_quality_summary, tierLabel, percent, frameCount)
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = modifier.widthIn(max = 460.dp)
+    ) {
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+            border = BorderStroke(1.dp, qualityColor.copy(alpha = 0.6f)),
+            modifier = Modifier
+                .weight(1f)
+                .testTag("capture_quality_meter")
+        ) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(9.dp)
+                                .clip(CircleShape)
+                                .background(qualityColor)
+                        )
+                        Text(
+                            text = summaryText,
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+
+                // Red -> Amber -> Green bar track with glowing animated fill
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(10.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(
+                            Brush.horizontalGradient(
+                                listOf(
+                                    ErrorCrimson.copy(alpha = 0.24f),
+                                    WarmAmber.copy(alpha = 0.24f),
+                                    QualityGreen.copy(alpha = 0.24f),
+                                    QualityEmerald.copy(alpha = 0.26f)
+                                )
+                            )
+                        )
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .fillMaxWidth(animatedScore.coerceAtLeast(0.04f))
+                            .clip(RoundedCornerShape(50))
+                            .background(
+                                Brush.horizontalGradient(
+                                    listOf(
+                                        ErrorCrimson,
+                                        if (animatedScore >= 0.35f) WarmAmber else ErrorCrimson,
+                                        qualityColor
+                                    )
+                                )
+                            )
+                    )
+                }
+            }
+        }
+
+        TiltLevelMeterPill(
+            tiltX = tiltX,
+            tiltY = tiltY,
+            isOffLevel = isTiltOffLevel
+        )
     }
 }
 
@@ -801,22 +1001,21 @@ private fun TiltLevelMeterPill(
     val levelDesc = stringResource(if (isOffLevel) R.string.tilt_meter_adjust else R.string.tilt_meter_level)
 
     Surface(
-        shape = RoundedCornerShape(50),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.86f),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
         modifier = modifier
-            .border(1.dp, activeColor.copy(alpha = 0.55f), RoundedCornerShape(50))
+            .border(1.dp, activeColor.copy(alpha = 0.55f), RoundedCornerShape(18.dp))
             .semantics(mergeDescendants = true) { contentDescription = levelDesc }
             .testTag("tilt_level_meter")
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
         ) {
-            Canvas(modifier = Modifier.size(26.dp)) {
+            Canvas(modifier = Modifier.size(24.dp)) {
                 val r = size.minDimension / 2f
                 val center = Offset(size.width / 2f, size.height / 2f)
-                // Outer ring + target sweet-spot circle + subtle crosshairs
                 drawCircle(
                     color = Color.White.copy(alpha = 0.25f),
                     radius = r - 1.dp.toPx(),
@@ -835,29 +1034,27 @@ private fun TiltLevelMeterPill(
                     end = Offset(center.x, center.y + r - 2.dp.toPx()),
                     strokeWidth = 0.8.dp.toPx()
                 )
-                // Inner sweet-spot circle matches exact ~3.2° tilt gate out of 5.5° full travel
-                val maxTravel = r - 4.5.dp.toPx()
-                val sweetSpotRadius = maxTravel * (3.2f / 5.5f)
+                val maxTravel = r - 4.dp.toPx()
+                val sweetSpotRadius = maxTravel * (4.2f / 5.5f)
                 drawCircle(
                     color = activeColor.copy(alpha = 0.72f),
                     radius = sweetSpotRadius,
                     center = center,
                     style = Stroke(width = 1.2.dp.toPx())
                 )
-                // Clamped live spirit-level bubble
                 val clampedDist = kotlin.math.hypot(tiltX, tiltY)
                 val scale = if (clampedDist > 1f) 1f / clampedDist else 1f
                 val bx = center.x + tiltX * scale * maxTravel
                 val by = center.y + tiltY * scale * maxTravel
                 drawCircle(
                     color = activeColor,
-                    radius = 3.8.dp.toPx(),
+                    radius = 3.5.dp.toPx(),
                     center = Offset(bx, by)
                 )
             }
             Text(
                 text = levelDesc,
-                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
                 color = activeColor
             )
         }

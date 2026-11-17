@@ -1,5 +1,6 @@
 package com.example
 
+import com.example.capture.CaptureQualityTier
 import com.example.capture.CaptureViewModel
 import com.example.capture.SmartCaptureHelpers
 import org.junit.Assert.assertEquals
@@ -63,7 +64,7 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun quaternionAngleDegreesDetectsSmallTiltDriftForCaptureGate() {
+    fun quaternionAngleDegreesDetectsSmallTiltDrift() {
         // 10° roll around Z axis (sin(5°) ≈ 0.08716, cos(5°) ≈ 0.99619)
         val qz = kotlin.math.sin(Math.toRadians(5.0)).toFloat()
         val qw = kotlin.math.cos(Math.toRadians(5.0)).toFloat()
@@ -72,6 +73,66 @@ class ExampleUnitTest {
             0f, 0f, qz, qw
         )
         assertEquals(10f, angleDeg, 0.05f)
-        assertTrue(angleDeg > 3.6f)
+    }
+
+    @Test
+    fun computeRelativePoseToHeroExtractsRollFromQuaternions() {
+        // Negative Z quaternion (-10° around +Z) rolls camera CW so up tilts toward +right
+        val qz = kotlin.math.sin(Math.toRadians(-5.0)).toFloat()
+        val qw = kotlin.math.cos(Math.toRadians(-5.0)).toFloat()
+        val rel = SmartCaptureHelpers.computeRelativePoseToHero(
+            heroQx = 0f, heroQy = 0f, heroQz = 0f, heroQw = 1f,
+            frameQx = 0f, frameQy = 0f, frameQz = qz, frameQw = qw
+        )
+        assertEquals(10f, rel.relRollDeg, 0.1f)
+        assertEquals(0f, rel.relYawDeg, 0.1f)
+        assertEquals(0f, rel.relPitchDeg, 0.1f)
+    }
+
+    @Test
+    fun computeCaptureQualityScoreProgressesFromPoorToExcellent() {
+        val (poorScore, poorTier) = CaptureViewModel.computeCaptureQualityScore(
+            frameCount = 1,
+            spanX = 0f,
+            spanY = 0f,
+            avgTileDetail = 0.05f,
+            avgGyroMag = 0.2f,
+            hasMetricDepthFrames = false
+        )
+        assertEquals(CaptureQualityTier.POOR, poorTier)
+        assertTrue(poorScore < 0.35f)
+
+        val (fairScore, fairTier) = CaptureViewModel.computeCaptureQualityScore(
+            frameCount = 3,
+            spanX = 0.45f,
+            spanY = 0.25f,
+            avgTileDetail = 0.35f,
+            avgGyroMag = 0.3f,
+            hasMetricDepthFrames = false
+        )
+        assertEquals(CaptureQualityTier.FAIR, fairTier)
+        assertTrue(fairScore in 0.35f..0.62f)
+
+        val (goodScore, goodTier) = CaptureViewModel.computeCaptureQualityScore(
+            frameCount = 6,
+            spanX = 0.70f,
+            spanY = 0.50f,
+            avgTileDetail = 0.65f,
+            avgGyroMag = 0.25f,
+            hasMetricDepthFrames = false
+        )
+        assertEquals(CaptureQualityTier.GOOD, goodTier)
+        assertTrue(goodScore in 0.62f..0.82f)
+
+        val (excScore, excTier) = CaptureViewModel.computeCaptureQualityScore(
+            frameCount = 8,
+            spanX = 0.90f,
+            spanY = 0.75f,
+            avgTileDetail = 0.85f,
+            avgGyroMag = 0.15f,
+            hasMetricDepthFrames = true
+        )
+        assertEquals(CaptureQualityTier.EXCELLENT, excTier)
+        assertTrue(excScore >= 0.82f)
     }
 }

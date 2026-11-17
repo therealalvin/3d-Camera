@@ -15,8 +15,11 @@ object YuvBitmapConverter {
         if (image.format != ImageFormat.YUV_420_888) return null
         val nv21 = yuv420ToNv21(image)
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+        val crop = image.cropRect.takeIf {
+            !it.isEmpty && it.left >= 0 && it.top >= 0 && it.right <= image.width && it.bottom <= image.height
+        } ?: Rect(0, 0, image.width, image.height)
         val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 94, out)
+        yuvImage.compressToJpeg(crop, 94, out)
         val rawBytes = out.toByteArray()
         val rawBmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return null
         return rotateBitmap(rawBmp, rotationDegrees)
@@ -42,15 +45,15 @@ object YuvBitmapConverter {
         val uPlane = image.planes[1]
         val vPlane = image.planes[2]
 
-        val yBuffer = yPlane.buffer
-        val uBuffer = uPlane.buffer
-        val vBuffer = vPlane.buffer
+        val yBuffer = yPlane.buffer.apply { rewind() }
+        val uBuffer = uPlane.buffer.apply { rewind() }
+        val vBuffer = vPlane.buffer.apply { rewind() }
 
         val yRowStride = yPlane.rowStride
         val yPixelStride = yPlane.pixelStride
         var pos = 0
 
-        if (yPixelStride == 1 && yRowStride == width) {
+        if (yPixelStride == 1 && yRowStride == width && yBuffer.remaining() >= ySize) {
             yBuffer.get(nv21, 0, ySize)
             pos = ySize
         } else {

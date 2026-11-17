@@ -13,6 +13,8 @@ val SpatialMintContainer = Color(0xFF0B3B34)
 
 val OpticalCobalt = Color(0xFF4C9AFF)
 val WarmAmber = Color(0xFFFFB020)
+val QualityGreen = Color(0xFF22C55E)
+val QualityEmerald = Color(0xFF10B981)
 val ErrorCrimson = Color(0xFFFF5A6E)
 
 val PureChalk = Color(0xFFF4F7FB)

@@ -12,6 +12,7 @@ import com.example.data.CapturedFrameData
 import com.example.data.SpatialMediaRepository
 import com.example.imaging.DynamicDepthCodec
 import com.example.imaging.MetricDepthObservation
+import com.example.imaging.RectifiedFrameResult
 import com.example.imaging.RefinedDepthResult
 import com.example.imaging.StereoNeighborObservation
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +38,13 @@ enum class CapturePhase {
     PROCESSING
 }
 
+enum class CaptureQualityTier {
+    POOR,
+    FAIR,
+    GOOD,
+    EXCELLENT
+}
+
 data class StagedCapture(
     val heroBitmap: Bitmap,
     val depthResult: RefinedDepthResult,
@@ -48,6 +56,10 @@ data class CaptureUiState(
     val tileDetails: List<Float> = List(CaptureViewModel.TILE_COUNT) { 0f },
     val clearedTilesCount: Int = 0,
     val detailPercent: Int = 0,
+    val capturedFrameCount: Int = 0,
+    val qualityScore: Float = 0f,
+    val qualityTier: CaptureQualityTier = CaptureQualityTier.POOR,
+    val canAcceptCapture: Boolean = false,
     val brushX: Float = 0f,
     val brushY: Float = 0f,
     val tiltMeterX: Float = 0f,
@@ -75,6 +87,7 @@ private data class StagedFrame(
     val qw: Float,
     val aimYawDeg: Float,
     val aimUpDeg: Float,
+    val rollRightDeg: Float,
     val nx: Float,
     val ny: Float,
     val gyroMag: Float,
@@ -195,11 +208,10 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun onShutterPressed(onCaptureReadyForReview: () -> Unit) {
-        val current = _uiState.value
-        when (current.phase) {
+        when (_uiState.value.phase) {
             CapturePhase.READY -> beginSweep()
             CapturePhase.SWEEPING -> {
-                if (framePool.size >= 3) {
+                if (canAcceptFrames()) {
                     finalizeSweepForReview(onCaptureReadyForReview)
                 } else {
                     cancelSweep()
@@ -207,6 +219,23 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             }
             CapturePhase.PROCESSING -> Unit
         }
+    }
+
+    fun onAcceptCapturePressed(onCaptureReadyForReview: () -> Unit) {
+        if (_uiState.value.phase != CapturePhase.SWEEPING || completionTriggered) return
+        if (!canAcceptFrames()) return
+        finalizeSweepForReview(onCaptureReadyForReview)
+    }
+
+    fun onCancelCapturePressed() {
+        if (_uiState.value.phase == CapturePhase.SWEEPING) {
+            cancelSweep()
+        }
+    }
+
+    private fun canAcceptFrames(): Boolean {
+        return framePool.size >= MIN_FRAMES_TO_ACCEPT ||
+            (_uiState.value.isArCoreModeActive && framePool.any { it.depthBuffer != null })
     }
 
     private fun resetWaveTracking() {
@@ -229,9 +258,24 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         completionTriggered = false
     }
 
-    private fun isMotionTiltAcceptable(isArCoreActive: Boolean, motion: MotionSample): Boolean {
-        val dev = if (isArCoreActive) motion.tiltDeviationDeg else motion.rollDeviationDeg
-        return dev <= TILT_CAPTURE_GATE_DEG
+    private fun currentQualityState(): Pair<Float, CaptureQualityTier> {
+        val avgTileDetail = tileProgress.sum() / TILE_COUNT
+        val avgGyro = if (framePool.isNotEmpty()) {
+            framePool.map { it.gyroMag }.average().toFloat()
+        } else {
+            0f
+        }
+        val hasMetric = framePool.any { it.depthBuffer != null }
+        val spanX = maxNx - minNx
+        val spanY = maxNy - minNy
+        return computeCaptureQualityScore(
+            frameCount = framePool.size,
+            spanX = spanX,
+            spanY = spanY,
+            avgTileDetail = avgTileDetail,
+            avgGyroMag = avgGyro,
+            hasMetricDepthFrames = hasMetric
+        )
     }
 
     private fun processWaveMotionSample(
@@ -244,58 +288,57 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         val nx = nxRaw.coerceIn(-1f, 1f)
         val ny = nyRaw.coerceIn(-1f, 1f)
         val current = _uiState.value
-        val tiltAcceptable = isMotionTiltAcceptable(current.isArCoreModeActive, motion)
 
         currentNx = nx
         currentNy = ny
         val stepDist = hypot(nx - lastBrushNx, ny - lastBrushNy)
-        val (brushCol, brushRow) = computeBrushGridPos(nx, ny, GRID_COLS, GRID_ROWS)
+
+        minNx = min(minNx, nx)
+        maxNx = max(maxNx, nx)
+        minNy = min(minNy, ny)
+        maxNy = max(maxNy, ny)
+
+        val spanX = maxNx - minNx
+        val spanY = maxNy - minNy
+        val gentleEnough = motion.gyroMagnitudeRadPerSec < MAX_CAPTURE_GYRO_RAD_PER_SEC
+        val steadyWeight = (1f - (motion.gyroMagnitudeRadPerSec / (MAX_CAPTURE_GYRO_RAD_PER_SEC + 0.35f)))
+            .coerceIn(0.35f, 1f)
 
         var tilesChanged = false
-        if (tiltAcceptable) {
-            minNx = min(minNx, nx)
-            maxNx = max(maxNx, nx)
-            minNy = min(minNy, ny)
-            maxNy = max(maxNy, ny)
+        val subSteps = if (stepDist >= 0.10f) 3 else 1
+        for (s in 1..subSteps) {
+            val t = s.toFloat() / subSteps
+            val sx = lastBrushNx + (nx - lastBrushNx) * t
+            val sy = lastBrushNy + (ny - lastBrushNy) * t
+            val (sCol, sRow) = computeBrushGridPos(sx, sy, GRID_COLS, GRID_ROWS)
+            val segDist = stepDist / subSteps
 
-            val spanX = maxNx - minNx
-            val spanY = maxNy - minNy
-            val gentleEnoughForPaint = motion.gyroMagnitudeRadPerSec < 1.25f
+            for (r in 0 until GRID_ROWS) {
+                for (c in 0 until GRID_COLS) {
+                    val idx = r * GRID_COLS + c
+                    val prev = tileProgress[idx]
+                    val dCol = c - sCol
+                    val dRow = r - sRow
+                    val dSq = dCol * dCol + dRow * dRow
+                    val eraserFalloff = exp(-dSq / 0.85f)
 
-            // Sample along the motion segment between previous and current positions so movement
-            // between boxes smoothly credits the swept path without forcing robotic pauses
-            val subSteps = if (stepDist >= 0.10f) 3 else 1
-            for (s in 1..subSteps) {
-                val t = s.toFloat() / subSteps
-                val sx = lastBrushNx + (nx - lastBrushNx) * t
-                val sy = lastBrushNy + (ny - lastBrushNy) * t
-                val (sCol, sRow) = computeBrushGridPos(sx, sy, GRID_COLS, GRID_ROWS)
-                val segDist = stepDist / subSteps
+                    var nextVal = prev
+                    if (gentleEnough && segDist >= 0.008f) {
+                        nextVal = max(
+                            nextVal,
+                            (prev + eraserFalloff * segDist * 0.95f * steadyWeight).coerceAtMost(1f)
+                        )
+                    }
+                    if (s == subSteps && tileDepthDensities != null && idx < tileDepthDensities.size &&
+                        dSq <= 1.25f && (spanX + spanY) > 0.15f
+                    ) {
+                        val arBoost = (tileDepthDensities[idx] * 0.20f + eraserFalloff * 0.12f).coerceAtMost(0.32f)
+                        nextVal = max(nextVal, arBoost)
+                    }
 
-                for (r in 0 until GRID_ROWS) {
-                    for (c in 0 until GRID_COLS) {
-                        val idx = r * GRID_COLS + c
-                        val prev = tileProgress[idx]
-                        val dCol = c - sCol
-                        val dRow = r - sRow
-                        val dSq = dCol * dCol + dRow * dRow
-                        val eraserFalloff = exp(-dSq / 0.78f)
-
-                        var nextVal = prev
-                        if (gentleEnoughForPaint && segDist >= 0.008f) {
-                            nextVal = max(nextVal, (prev + eraserFalloff * segDist * 0.95f).coerceAtMost(1f))
-                        }
-                        if (s == subSteps && tileDepthDensities != null && idx < tileDepthDensities.size &&
-                            dSq <= 1.15f && (spanX + spanY) > 0.20f
-                        ) {
-                            val arBoost = (tileDepthDensities[idx] * 0.20f + eraserFalloff * 0.12f).coerceAtMost(0.32f)
-                            nextVal = max(nextVal, arBoost)
-                        }
-
-                        if (abs(nextVal - prev) >= 0.02f) {
-                            tileProgress[idx] = nextVal
-                            tilesChanged = true
-                        }
+                    if (abs(nextVal - prev) >= 0.02f) {
+                        tileProgress[idx] = nextVal
+                        tilesChanged = true
                     }
                 }
             }
@@ -310,37 +353,40 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         if (tilesChanged || brushMoved) {
             val cleared = tileProgress.count { it >= TILE_DONE_THRESHOLD }
             val avgDetail = (tileProgress.sum() / TILE_COUNT * 100f).roundToInt().coerceIn(0, 100)
-            _uiState.value = current.copy(
+            val (qScore, qTier) = currentQualityState()
+            _uiState.value = _uiState.value.copy(
                 tileDetails = tileProgress.toList(),
                 clearedTilesCount = cleared,
                 detailPercent = avgDetail,
+                qualityScore = qScore,
+                qualityTier = qTier,
+                capturedFrameCount = framePool.size,
+                canAcceptCapture = canAcceptFrames(),
                 brushX = nx,
                 brushY = ny
             )
         }
 
-        if (tiltAcceptable && !grabInFlight && motion.gyroMagnitudeRadPerSec < 0.80f) {
+        // Capture freely as camera moves/pans/tilts whenever motion isn't violently blurry
+        if (!grabInFlight && motion.gyroMagnitudeRadPerSec < MAX_CAPTURE_GYRO_RAD_PER_SEC) {
             val now = System.currentTimeMillis()
             val minExistingDist = framePool.minOfOrNull { hypot(nx - it.nx, ny - it.ny) } ?: Float.MAX_VALUE
-            // Capture steady frames both over boxes and along the paths in between
-            val needMoreEarly = framePool.size < AUTO_FINISH_MIN_FRAMES && now - lastGrabAtMs >= 180L && minExistingDist >= 0.14f
-            val newRegionPoint = now - lastGrabAtMs >= 160L && minExistingDist >= 0.22f
+            val minAngleDelta = framePool.minOfOrNull {
+                val dy = MotionSensorMonitor.wrapAngleDelta(motion.aimYawDeg, it.aimYawDeg)
+                val dp = MotionSensorMonitor.wrapAngleDelta(motion.aimUpDeg, it.aimUpDeg)
+                val dr = MotionSensorMonitor.wrapAngleDelta(motion.rollRightDeg, it.rollRightDeg)
+                hypot(hypot(dy, dp), dr)
+            } ?: Float.MAX_VALUE
 
-            if (needMoreEarly || newRegionPoint) {
+            val elapsed = now - lastGrabAtMs
+            val earlyRamp = framePool.size < 6 && elapsed >= 170L && (minExistingDist >= 0.10f || minAngleDelta >= 2.0f)
+            val newRegion = elapsed >= 160L && (minExistingDist >= 0.18f || minAngleDelta >= 3.2f)
+            val periodicRefresh = elapsed >= 550L && framePool.size < MAX_FRAME_POOL
+
+            if (earlyRamp || newRegion || periodicRefresh) {
                 triggerFrameGrab(nx = nx, ny = ny)
             }
         }
-    }
-
-    private fun isCaptureGoalMet(): Boolean {
-        val cleared = tileProgress.count { it >= TILE_DONE_THRESHOLD }
-        val spanX = maxNx - minNx
-        val spanY = maxNy - minNy
-        // Require all 9/9 areas cleared cleanly with solid intermediate frame coverage
-        return cleared >= AUTO_FINISH_MIN_TILES &&
-            framePool.size >= AUTO_FINISH_MIN_FRAMES &&
-            spanX >= 0.85f &&
-            spanY >= 0.70f
     }
 
     private fun beginSweep() {
@@ -352,6 +398,10 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             tileDetails = List(TILE_COUNT) { 0f },
             clearedTilesCount = 0,
             detailPercent = 0,
+            capturedFrameCount = 0,
+            qualityScore = 0f,
+            qualityTier = CaptureQualityTier.POOR,
+            canAcceptCapture = false,
             brushX = 0f,
             brushY = 0f,
             tiltMeterX = 0f,
@@ -372,6 +422,10 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             tileDetails = List(TILE_COUNT) { 0f },
             clearedTilesCount = 0,
             detailPercent = 0,
+            capturedFrameCount = 0,
+            qualityScore = 0f,
+            qualityTier = CaptureQualityTier.POOR,
+            canAcceptCapture = false,
             brushX = 0f,
             brushY = 0f,
             tiltMeterX = 0f,
@@ -428,13 +482,12 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             }
 
             val motion = sensorMonitor.motion.value
-            val tiltOk = isMotionTiltAcceptable(state.isArCoreModeActive, motion)
             val activeTiltDeg = if (state.isArCoreModeActive) motion.tiltDeviationDeg else motion.rollDeviationDeg
             grabInFlight = false
             _uiState.value = _uiState.value.copy(requestFrameGrab = false)
 
-            // Reject tilted frames that slipped past the gate while frame was in flight (unless pool empty)
-            if (!tiltOk && framePool.isNotEmpty()) {
+            // Reject extreme motion blur spikes once we already have a baseline frame
+            if (motion.gyroMagnitudeRadPerSec > 1.75f && framePool.isNotEmpty()) {
                 frame.colorBitmap.recycle()
                 return@post
             }
@@ -451,26 +504,27 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 qw = frame.qw,
                 aimYawDeg = motion.aimYawDeg,
                 aimUpDeg = motion.aimUpDeg,
+                rollRightDeg = motion.rollRightDeg,
                 nx = pendingGrabNx,
                 ny = pendingGrabNy,
                 gyroMag = motion.gyroMagnitudeRadPerSec,
                 tiltDeg = activeTiltDeg
             )
 
-            // Credit detail right under this frame AND bridge in-between overlap from closest nearby level frame
+            // Credit detail right under this frame AND bridge in-between overlap from nearby frames
             val (bCol, bRow) = computeBrushGridPos(candidate.nx, candidate.ny, GRID_COLS, GRID_ROWS)
             for (r in 0 until GRID_ROWS) {
                 for (c in 0 until GRID_COLS) {
                     val idx = r * GRID_COLS + c
                     val dSq = (c - bCol) * (c - bCol) + (r - bRow) * (r - bRow)
-                    if (dSq <= 0.95f) {
+                    if (dSq <= 1.05f) {
                         val boost = exp(-dSq / 0.85f) * 0.42f
                         tileProgress[idx] = max(tileProgress[idx], (tileProgress[idx] + boost).coerceAtMost(1f))
                     }
                 }
             }
             val nearestPrev = framePool
-                .filter { hypot(candidate.nx - it.nx, candidate.ny - it.ny) in 0.12f..0.75f }
+                .filter { hypot(candidate.nx - it.nx, candidate.ny - it.ny) in 0.12f..0.80f }
                 .minByOrNull { hypot(candidate.nx - it.nx, candidate.ny - it.ny) }
             if (nearestPrev != null) {
                 val (mCol, mRow) = computeBrushGridPos(
@@ -483,8 +537,8 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     for (c in 0 until GRID_COLS) {
                         val idx = r * GRID_COLS + c
                         val dSq = (c - mCol) * (c - mCol) + (r - mRow) * (r - mRow)
-                        if (dSq <= 0.65f) {
-                            val bridgeBoost = exp(-dSq / 0.65f) * 0.22f
+                        if (dSq <= 0.70f) {
+                            val bridgeBoost = exp(-dSq / 0.65f) * 0.24f
                             tileProgress[idx] = max(tileProgress[idx], (tileProgress[idx] + bridgeBoost).coerceAtMost(1f))
                         }
                     }
@@ -494,17 +548,17 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             if (framePool.size < MAX_FRAME_POOL) {
                 framePool.add(candidate)
             } else {
-                // Keep the sharpest, most level frames by replacing the closest wobblier/tilted frame
+                // Keep crispest, well-spread frames by replacing closest less-steady frame
                 val closestIdx = framePool.indices.minByOrNull { i ->
                     hypot(framePool[i].nx - candidate.nx, framePool[i].ny - candidate.ny)
                 } ?: -1
-                val candPenalty = candidate.gyroMag + candidate.tiltDeg * 0.25f
+                val candPenalty = candidate.gyroMag + candidate.tiltDeg * 0.08f
                 val prevPenalty = if (closestIdx >= 0) {
-                    framePool[closestIdx].gyroMag + framePool[closestIdx].tiltDeg * 0.25f
+                    framePool[closestIdx].gyroMag + framePool[closestIdx].tiltDeg * 0.08f
                 } else {
                     0f
                 }
-                if (closestIdx >= 0 && candPenalty + 0.10f < prevPenalty) {
+                if (closestIdx >= 0 && candPenalty + 0.08f < prevPenalty) {
                     framePool[closestIdx].colorBitmap.recycle()
                     framePool[closestIdx] = candidate
                 } else {
@@ -514,16 +568,17 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
 
             val cleared = tileProgress.count { it >= TILE_DONE_THRESHOLD }
             val avgDetail = (tileProgress.sum() / TILE_COUNT * 100f).roundToInt().coerceIn(0, 100)
+            val (qScore, qTier) = currentQualityState()
             _uiState.value = _uiState.value.copy(
                 tileDetails = tileProgress.toList(),
                 clearedTilesCount = cleared,
-                detailPercent = avgDetail
+                detailPercent = avgDetail,
+                qualityScore = qScore,
+                qualityTier = qTier,
+                capturedFrameCount = framePool.size,
+                canAcceptCapture = canAcceptFrames()
             )
-
-            if (!completionTriggered && isCaptureGoalMet()) {
-                completionTriggered = true
-                finalizeSweepForReview(onCaptureReadyForReview)
-            }
+            // No auto-finish: user controls exact moment via Accept 3D button
         }
     }
 
@@ -544,48 +599,61 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             try {
                 val staged = withContext(Dispatchers.Default) {
-                    // Pick the single sharpest, centered, most level frame as the RGB Hero
+                    // Pick the single sharpest, centered, steady frame as the Hero optical reference
                     val hasAnyMetricDepth = framesSnapshot.any { it.depthBuffer != null }
                     val hero = framesSnapshot.maxByOrNull { f ->
                         val sharpness = SmartCaptureHelpers.measureBitmapSharpness(f.colorBitmap)
                         val centerScore = 1f / (1f + hypot(f.nx, f.ny) * 1.4f)
                         val steadyScore = 1f / (1f + f.gyroMag * 2.0f)
-                        val levelScore = 1f / (1f + f.tiltDeg * 1.6f)
+                        val levelScore = 1f / (1f + f.tiltDeg * 0.35f)
                         val depthBonus = if (!hasAnyMetricDepth || f.depthBuffer != null) 1.25f else 0.7f
                         (sharpness + 10f) * centerScore * steadyScore * levelScore * depthBonus
                     } ?: framesSnapshot.first()
 
-                    // Exclude any rotated/skewed frames whose orientation drifted >3.8° from Hero
-                    val hasQuatPose = abs(hero.qx) + abs(hero.qy) + abs(hero.qz) + abs(hero.qw) > 0.1f
-                    val levelFrames = framesSnapshot.filter { f ->
-                        if (f === hero) return@filter true
-                        val qAngleOk = if (hasQuatPose && abs(f.qx) + abs(f.qy) + abs(f.qz) + abs(f.qw) > 0.1f) {
-                            SmartCaptureHelpers.quaternionAngleDegrees(
-                                hero.qx, hero.qy, hero.qz, hero.qw,
-                                f.qx, f.qy, f.qz, f.qw
-                            ) <= TILT_CAPTURE_GATE_DEG
-                        } else {
-                            abs(f.tiltDeg - hero.tiltDeg) <= TILT_CAPTURE_GATE_DEG
-                        }
-                        qAngleOk && f.tiltDeg <= TILT_CAPTURE_GATE_DEG + 0.4f
-                    }
-                    val usablePool = if (levelFrames.size >= 2) levelFrames else framesSnapshot
-
-                    val nearbySharpBitmaps = usablePool
-                        .asSequence()
-                        .filter { it !== hero }
-                        .sortedBy { hypot(it.nx - hero.nx, it.ny - hero.ny) + it.gyroMag * 0.5f + it.tiltDeg * 0.25f }
-                        .take(3)
-                        .map { it.colorBitmap }
-                        .toList()
-                    val enhancedHero = DynamicDepthCodec.enhanceHeroFromMultiFrameSweep(
-                        heroBitmap = hero.colorBitmap,
-                        nearbyBitmaps = nearbySharpBitmaps
+                    data class AlignedNeighbor(
+                        val source: StagedFrame,
+                        val pose: RelativeFramePose,
+                        val rectified: RectifiedFrameResult
                     )
 
-                    val stereoNeighbors = usablePool
-                        .filter { it !== hero }
-                        .map { f ->
+                    val alignedNeighbors = mutableListOf<AlignedNeighbor>()
+                    try {
+                        for (f in framesSnapshot) {
+                            if (f === hero) continue
+                            val relPose = SmartCaptureHelpers.computeRelativePoseToHero(
+                                heroQx = hero.qx, heroQy = hero.qy, heroQz = hero.qz, heroQw = hero.qw,
+                                frameQx = f.qx, frameQy = f.qy, frameQz = f.qz, frameQw = f.qw,
+                                heroAimYawDeg = hero.aimYawDeg,
+                                heroAimUpDeg = hero.aimUpDeg,
+                                heroRollRightDeg = hero.rollRightDeg,
+                                frameAimYawDeg = f.aimYawDeg,
+                                frameAimUpDeg = f.aimUpDeg,
+                                frameRollRightDeg = f.rollRightDeg
+                            )
+                            val rect = DynamicDepthCodec.rectifyFrameToHeroPlane(
+                                heroBitmap = hero.colorBitmap,
+                                sourceBitmap = f.colorBitmap,
+                                relativePose = relPose
+                            )
+                            alignedNeighbors.add(AlignedNeighbor(f, relPose, rect))
+                        }
+
+                        val goodAligned = alignedNeighbors
+                            .filter { it.rectified.edgeMatchScore >= 0.30f }
+                            .ifEmpty { alignedNeighbors }
+
+                        val enhancedHero = DynamicDepthCodec.enhanceHeroWithAlignedFrames(
+                            heroBitmap = hero.colorBitmap,
+                            rectifiedFrames = goodAligned
+                                .sortedByDescending { it.rectified.edgeMatchScore / (1f + hypot(it.source.nx - hero.nx, it.source.ny - hero.ny)) }
+                                .map { it.rectified }
+                        )
+
+                        val heroW = max(1, hero.colorBitmap.width).toFloat()
+                        val heroH = max(1, hero.colorBitmap.height).toFloat()
+
+                        val stereoNeighbors = goodAligned.map { item ->
+                            val f = item.source
                             val (dxRight, dyUp) = SmartCaptureHelpers.projectWorldDeltaToCameraRightUp(
                                 dwx = f.tx - hero.tx,
                                 dwy = f.ty - hero.ty,
@@ -598,61 +666,81 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                             val effDx = if (abs(dxRight) > 0.004f) dxRight else (f.nx - hero.nx) * WAVE_HALF_SPAN_METERS
                             val effDy = if (abs(dyUp) > 0.004f) dyUp else -(f.ny - hero.ny) * WAVE_HALF_SPAN_METERS
                             StereoNeighborObservation(
-                                bitmap = f.colorBitmap,
+                                bitmap = item.rectified.bitmap,
                                 dxRight = effDx,
                                 dyUp = effDy,
-                                weight = 1f / (1f + f.gyroMag + f.tiltDeg * 0.5f)
+                                weight = (item.rectified.edgeMatchScore * 1.25f) / (1f + f.gyroMag * 0.8f)
                             )
                         }
 
-                    val metricObservations = usablePool.mapNotNull { f ->
-                        val db = f.depthBuffer ?: return@mapNotNull null
-                        val distFromHero = hypot(f.nx - hero.nx, f.ny - hero.ny)
-                        MetricDepthObservation(
-                            rawDepthMm = db.millimeters,
-                            width = db.width,
-                            height = db.height,
-                            weight = 1f / (1f + distFromHero * 1.4f + f.gyroMag + f.tiltDeg * 0.5f),
-                            isNearHero = distFromHero <= 0.25f
-                        )
-                    }
-                    val heroMetricObs = hero.depthBuffer?.let { db ->
-                        MetricDepthObservation(
-                            rawDepthMm = db.millimeters,
-                            width = db.width,
-                            height = db.height,
-                            weight = 1.6f / (1f + hero.gyroMag),
-                            isNearHero = true
-                        )
-                    }
+                        val alignedMap = alignedNeighbors.associateBy { it.source }
+                        val metricObservations = framesSnapshot.mapNotNull { f ->
+                            val db = f.depthBuffer ?: return@mapNotNull null
+                            val distFromHero = hypot(f.nx - hero.nx, f.ny - hero.ny)
+                            val alignedItem = alignedMap[f]
+                            val warpedDepth = if (alignedItem != null) {
+                                DynamicDepthCodec.rectifyDepth16ToHero(
+                                    depthBuffer = db,
+                                    relRollDeg = alignedItem.pose.relRollDeg,
+                                    residualDxRatio = alignedItem.rectified.residualDxPx / heroW,
+                                    residualDyRatio = alignedItem.rectified.residualDyPx / heroH
+                                )
+                            } else {
+                                db
+                            }
+                            val edgeFactor = alignedItem?.rectified?.edgeMatchScore ?: 1f
+                            MetricDepthObservation(
+                                rawDepthMm = warpedDepth.millimeters,
+                                width = warpedDepth.width,
+                                height = warpedDepth.height,
+                                weight = edgeFactor / (1f + distFromHero * 1.3f + f.gyroMag),
+                                isNearHero = distFromHero <= 0.30f
+                            )
+                        }
+                        val heroMetricObs = hero.depthBuffer?.let { db ->
+                            MetricDepthObservation(
+                                rawDepthMm = db.millimeters,
+                                width = db.width,
+                                height = db.height,
+                                weight = 1.6f / (1f + hero.gyroMag),
+                                isNearHero = true
+                            )
+                        }
 
-                    val depthResult: RefinedDepthResult = if (metricObservations.isNotEmpty()) {
-                        DynamicDepthCodec.fuseMultiFrameMetricDepth(
-                            colorBitmap = enhancedHero,
-                            heroDepth = heroMetricObs,
-                            allDepths = metricObservations,
-                            stereoFallbackNeighbors = stereoNeighbors
-                        )
-                    } else {
-                        DynamicDepthCodec.estimateAllFramesStereoDepth(
-                            centerBitmap = enhancedHero,
-                            neighbors = stereoNeighbors
-                        )
-                    }
+                        val depthResult: RefinedDepthResult = if (metricObservations.isNotEmpty()) {
+                            DynamicDepthCodec.fuseMultiFrameMetricDepth(
+                                colorBitmap = enhancedHero,
+                                heroDepth = heroMetricObs,
+                                allDepths = metricObservations,
+                                stereoFallbackNeighbors = stereoNeighbors
+                            )
+                        } else {
+                            DynamicDepthCodec.estimateAllFramesStereoDepth(
+                                centerBitmap = enhancedHero,
+                                neighbors = stereoNeighbors
+                            )
+                        }
 
-                    val sweepData = framesSnapshot.map { f ->
-                        CapturedFrameData(
-                            bitmap = f.colorBitmap,
-                            tx = f.tx, ty = f.ty, tz = f.tz,
-                            qx = f.qx, qy = f.qy, qz = f.qz, qw = f.qw
-                        )
-                    }
+                        val sweepData = framesSnapshot.map { f ->
+                            CapturedFrameData(
+                                bitmap = f.colorBitmap,
+                                tx = f.tx, ty = f.ty, tz = f.tz,
+                                qx = f.qx, qy = f.qy, qz = f.qz, qw = f.qw
+                            )
+                        }
 
-                    StagedCapture(
-                        heroBitmap = enhancedHero,
-                        depthResult = depthResult,
-                        sweepFrames = sweepData
-                    )
+                        StagedCapture(
+                            heroBitmap = enhancedHero,
+                            depthResult = depthResult,
+                            sweepFrames = sweepData
+                        )
+                    } finally {
+                        alignedNeighbors.forEach {
+                            if (!it.rectified.bitmap.isRecycled) {
+                                it.rectified.bitmap.recycle()
+                            }
+                        }
+                    }
                 }
 
                 discardStagedCapture()
@@ -662,6 +750,10 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     tileDetails = List(TILE_COUNT) { 0f },
                     clearedTilesCount = 0,
                     detailPercent = 0,
+                    capturedFrameCount = 0,
+                    qualityScore = 0f,
+                    qualityTier = CaptureQualityTier.POOR,
+                    canAcceptCapture = false,
                     brushX = 0f,
                     brushY = 0f,
                     tiltMeterX = 0f,
@@ -678,6 +770,10 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     tileDetails = List(TILE_COUNT) { 0f },
                     clearedTilesCount = 0,
                     detailPercent = 0,
+                    capturedFrameCount = 0,
+                    qualityScore = 0f,
+                    qualityTier = CaptureQualityTier.POOR,
+                    canAcceptCapture = false,
                     brushX = 0f,
                     brushY = 0f,
                     tiltMeterX = 0f,
@@ -723,6 +819,10 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             tileDetails = List(TILE_COUNT) { 0f },
             clearedTilesCount = 0,
             detailPercent = 0,
+            capturedFrameCount = 0,
+            qualityScore = 0f,
+            qualityTier = CaptureQualityTier.POOR,
+            canAcceptCapture = false,
             brushX = 0f,
             brushY = 0f,
             tiltMeterX = 0f,
@@ -756,13 +856,12 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         const val TILE_COUNT = GRID_COLS * GRID_ROWS
         const val TILE_DONE_THRESHOLD = 0.85f
 
-        private const val AUTO_FINISH_MIN_TILES = TILE_COUNT
-        private const val AUTO_FINISH_MIN_FRAMES = 6
-        private const val MAX_FRAME_POOL = 12
-        private const val TILT_LEVEL_TOLERANCE_DEG = 3.2f
-        private const val TILT_CAPTURE_GATE_DEG = 3.6f
+        private const val MIN_FRAMES_TO_ACCEPT = 2
+        private const val MAX_FRAME_POOL = 14
+        private const val TILT_LEVEL_TOLERANCE_DEG = 4.2f
+        private const val MAX_CAPTURE_GYRO_RAD_PER_SEC = 1.35f
 
-        // Natural ~2.2-inch left/right and up/down chalkboard wave radius
+        // Natural ~2.2-inch left/right and up/down wave radius
         private const val WAVE_HALF_SPAN_METERS = 0.055f
         private const val WAVE_HALF_SPAN_DEG = 5.5f
 
@@ -775,6 +874,36 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             val brushCol = (((nx / 0.80f) + 1f) * 0.5f * (cols - 1)).coerceIn(0f, (cols - 1).toFloat())
             val brushRow = (((ny / 0.80f) + 1f) * 0.5f * (rows - 1)).coerceIn(0f, (rows - 1).toFloat())
             return brushCol to brushRow
+        }
+
+        internal fun computeCaptureQualityScore(
+            frameCount: Int,
+            spanX: Float,
+            spanY: Float,
+            avgTileDetail: Float,
+            avgGyroMag: Float,
+            hasMetricDepthFrames: Boolean
+        ): Pair<Float, CaptureQualityTier> {
+            if (frameCount <= 0) return 0f to CaptureQualityTier.POOR
+            val frameScore = (frameCount / 7f).coerceIn(0f, 1f) * 0.32f
+            val hSpanScore = (spanX / 0.85f).coerceIn(0f, 1f) * 0.20f
+            val vSpanScore = (spanY / 0.70f).coerceIn(0f, 1f) * 0.16f
+            val coverageScore = avgTileDetail.coerceIn(0f, 1f) * 0.10f
+            val steadyScore = (1f - (avgGyroMag / 1.4f)).coerceIn(0f, 1f) * 0.14f
+            val depthBonus = when {
+                hasMetricDepthFrames -> 0.08f
+                frameCount >= 3 -> 0.05f
+                else -> 0f
+            }
+            val score = (frameScore + hSpanScore + vSpanScore + coverageScore + steadyScore + depthBonus)
+                .coerceIn(0f, 1f)
+            val tier = when {
+                score >= 0.82f -> CaptureQualityTier.EXCELLENT
+                score >= 0.62f -> CaptureQualityTier.GOOD
+                score >= 0.35f -> CaptureQualityTier.FAIR
+                else -> CaptureQualityTier.POOR
+            }
+            return score to tier
         }
     }
 }
