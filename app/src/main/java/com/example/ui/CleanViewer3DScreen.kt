@@ -5,8 +5,6 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -41,14 +39,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -66,6 +62,8 @@ import com.example.ui.theme.SpatialMint
 import com.example.viewer.SpatialParallaxSurfaceView
 import com.example.viewer.ViewerUiState
 import com.example.viewer.ViewerViewModel
+import com.example.viewer.rememberSpatialViewportState
+import com.example.viewer.spatialLookAndZoomGestures
 
 @Composable
 fun CleanViewer3DScreen(
@@ -78,55 +76,46 @@ fun CleanViewer3DScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-    val motion by viewModel.sensorMonitor.motion.collectAsStateWithLifecycle()
+    val viewportState = rememberSpatialViewportState()
 
     var showChrome by remember { mutableStateOf(true) }
     var showDeleteDialog by remember { mutableStateOf(false) }
-    var dragOffsetX by remember { mutableFloatStateOf(0f) }
-    var dragOffsetY by remember { mutableFloatStateOf(0f) }
 
     val snackbarHostState = remember { SnackbarHostState() }
     val vrSavedMsg = stringResource(R.string.viewer_vr_saved)
 
     LaunchedEffect(photoId, externalUri) {
+        viewportState.reset()
         viewModel.load(photoId, externalUri)
     }
 
     val glSurfaceView = remember { SpatialParallaxSurfaceView(context) }
 
     DisposableEffect(lifecycleOwner) {
-        fun resumeViewer() {
-            viewModel.startMotionTilt()
-            glSurfaceView.onResume()
-        }
-
-        fun pauseViewer() {
-            viewModel.stopMotionTilt()
-            glSurfaceView.onPause()
-        }
-
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_RESUME -> resumeViewer()
-                Lifecycle.Event.ON_PAUSE -> pauseViewer()
+                Lifecycle.Event.ON_RESUME -> glSurfaceView.onResume()
+                Lifecycle.Event.ON_PAUSE -> glSurfaceView.onPause()
                 else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-            resumeViewer()
+            glSurfaceView.onResume()
         }
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            pauseViewer()
+            glSurfaceView.onPause()
         }
     }
 
-    // Feed combined phone tilt + touch drag into OpenGL ES parallax renderer
-    LaunchedEffect(motion.normTiltX, motion.normTiltY, dragOffsetX, dragOffsetY) {
-        val combinedX = (motion.normTiltX + dragOffsetX).coerceIn(-1f, 1f)
-        val combinedY = (motion.normTiltY + dragOffsetY).coerceIn(-1f, 1f)
-        glSurfaceView.setTiltOffset(combinedX, combinedY)
+    // Feed touch-drag look-around and pinch zoom/pan into OpenGL ES parallax renderer
+    LaunchedEffect(viewportState.lookX, viewportState.lookY) {
+        glSurfaceView.setTiltOffset(viewportState.lookX, viewportState.lookY)
+    }
+
+    LaunchedEffect(viewportState.zoom, viewportState.panX, viewportState.panY) {
+        glSurfaceView.setZoomAndPan(viewportState.zoom, viewportState.panX, viewportState.panY)
     }
 
     val readyState = uiState as? ViewerUiState.Ready
@@ -141,32 +130,10 @@ fun CleanViewer3DScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(ObsidianBackground)
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onTap = { showChrome = !showChrome },
-                    onDoubleTap = {
-                        dragOffsetX = 0f
-                        dragOffsetY = 0f
-                        viewModel.sensorMonitor.recenterTilt()
-                    }
-                )
-            }
-            .pointerInput(Unit) {
-                detectDragGestures(
-                    onDragEnd = {
-                        dragOffsetX = 0f
-                        dragOffsetY = 0f
-                    },
-                    onDragCancel = {
-                        dragOffsetX = 0f
-                        dragOffsetY = 0f
-                    }
-                ) { change, dragAmount ->
-                    change.consume()
-                    dragOffsetX = (dragOffsetX + dragAmount.x / 145f).coerceIn(-1f, 1f)
-                    dragOffsetY = (dragOffsetY + dragAmount.y / 145f).coerceIn(-1f, 1f)
-                }
-            }
+            .spatialLookAndZoomGestures(
+                state = viewportState,
+                onSingleTap = { showChrome = !showChrome }
+            )
     ) {
         when (val state = uiState) {
             ViewerUiState.Loading -> {

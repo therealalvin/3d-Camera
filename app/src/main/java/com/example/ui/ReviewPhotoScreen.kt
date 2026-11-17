@@ -4,8 +4,6 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -36,13 +34,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -54,10 +50,11 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.example.capture.CaptureViewModel
-import com.example.capture.MotionSensorMonitor
 import com.example.ui.theme.ObsidianBackground
 import com.example.ui.theme.SpatialMint
 import com.example.viewer.SpatialParallaxSurfaceView
+import com.example.viewer.rememberSpatialViewportState
+import com.example.viewer.spatialLookAndZoomGestures
 
 /**
  * Post-capture review screen showing the captured 3D parallax photo with Save or Retake actions,
@@ -73,11 +70,7 @@ fun ReviewPhotoScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val staged by viewModel.stagedCapture.collectAsStateWithLifecycle()
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-    val reviewSensorMonitor = remember(context) { MotionSensorMonitor(context) }
-    val motion by reviewSensorMonitor.motion.collectAsStateWithLifecycle()
-
-    var dragOffsetX by remember { mutableFloatStateOf(0f) }
-    var dragOffsetY by remember { mutableFloatStateOf(0f) }
+    val viewportState = rememberSpatialViewportState()
     var navigatedAway by remember { mutableStateOf(false) }
 
     val glSurfaceView = remember { SpatialParallaxSurfaceView(context) }
@@ -85,7 +78,6 @@ fun ReviewPhotoScreen(
     fun performRetake() {
         if (navigatedAway || uiState.isSaving) return
         navigatedAway = true
-        reviewSensorMonitor.stop()
         glSurfaceView.onPause()
         viewModel.resetForRetake()
         onRetake()
@@ -96,77 +88,45 @@ fun ReviewPhotoScreen(
     }
 
     DisposableEffect(lifecycleOwner) {
-        fun resumePreview() {
-            reviewSensorMonitor.recenterTilt()
-            reviewSensorMonitor.start(includeGyro = false)
-            glSurfaceView.onResume()
-        }
-
-        fun pausePreview() {
-            reviewSensorMonitor.stop()
-            glSurfaceView.onPause()
-        }
-
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_RESUME -> resumePreview()
-                Lifecycle.Event.ON_PAUSE -> pausePreview()
+                Lifecycle.Event.ON_RESUME -> glSurfaceView.onResume()
+                Lifecycle.Event.ON_PAUSE -> glSurfaceView.onPause()
                 else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-            resumePreview()
+            glSurfaceView.onResume()
         }
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            pausePreview()
+            glSurfaceView.onPause()
         }
     }
 
     LaunchedEffect(staged) {
         val current = staged ?: return@LaunchedEffect
+        viewportState.reset()
         glSurfaceView.setSpatialTextures(
             colorBitmap = current.heroBitmap,
             depthBitmap = current.depthResult.depthBitmap
         )
     }
 
-    LaunchedEffect(motion.normTiltX, motion.normTiltY, dragOffsetX, dragOffsetY) {
-        val combinedX = (motion.normTiltX + dragOffsetX).coerceIn(-1f, 1f)
-        val combinedY = (motion.normTiltY + dragOffsetY).coerceIn(-1f, 1f)
-        glSurfaceView.setTiltOffset(combinedX, combinedY)
+    LaunchedEffect(viewportState.lookX, viewportState.lookY) {
+        glSurfaceView.setTiltOffset(viewportState.lookX, viewportState.lookY)
+    }
+
+    LaunchedEffect(viewportState.zoom, viewportState.panX, viewportState.panY) {
+        glSurfaceView.setZoomAndPan(viewportState.zoom, viewportState.panX, viewportState.panY)
     }
 
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .background(ObsidianBackground)
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onDoubleTap = {
-                        dragOffsetX = 0f
-                        dragOffsetY = 0f
-                        reviewSensorMonitor.recenterTilt()
-                    }
-                )
-            }
-            .pointerInput(Unit) {
-                detectDragGestures(
-                    onDragEnd = {
-                        dragOffsetX = 0f
-                        dragOffsetY = 0f
-                    },
-                    onDragCancel = {
-                        dragOffsetX = 0f
-                        dragOffsetY = 0f
-                    }
-                ) { change, dragAmount ->
-                    change.consume()
-                    dragOffsetX = (dragOffsetX + dragAmount.x / 145f).coerceIn(-1f, 1f)
-                    dragOffsetY = (dragOffsetY + dragAmount.y / 145f).coerceIn(-1f, 1f)
-                }
-            }
+            .spatialLookAndZoomGestures(viewportState)
     ) {
         val isLandscape = maxWidth > maxHeight
 

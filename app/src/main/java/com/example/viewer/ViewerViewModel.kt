@@ -3,7 +3,6 @@ package com.example.viewer
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.capture.MotionSensorMonitor
 import com.example.data.AppDatabase
 import com.example.data.LoadedSpatialPhoto
 import com.example.data.SpatialMediaRepository
@@ -27,7 +26,6 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
 
     private val dao = AppDatabase.getInstance(application).spatialPhotoDao()
     private val repository = SpatialMediaRepository(application, dao)
-    val sensorMonitor = MotionSensorMonitor(application)
 
     private val _uiState = MutableStateFlow<ViewerUiState>(ViewerUiState.Loading)
     val uiState: StateFlow<ViewerUiState> = _uiState.asStateFlow()
@@ -37,21 +35,11 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             val loaded = repository.loadSpatialPhoto(photoId, externalUri)
             if (loaded != null) {
-                sensorMonitor.recenterTilt()
                 _uiState.value = ViewerUiState.Ready(photo = loaded)
             } else {
                 _uiState.value = ViewerUiState.Error("Could not open photo")
             }
         }
-    }
-
-    fun startMotionTilt() {
-        sensorMonitor.recenterTilt()
-        sensorMonitor.start(includeGyro = false)
-    }
-
-    fun stopMotionTilt() {
-        sensorMonitor.stop()
     }
 
     fun exportQuestVrSbs() {
@@ -82,10 +70,5 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
             repository.deletePhoto(entity)
             onDeleted()
         }
-    }
-
-    override fun onCleared() {
-        sensorMonitor.stop()
-        super.onCleared()
     }
 }

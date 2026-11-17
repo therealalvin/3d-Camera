@@ -15,7 +15,7 @@ import kotlin.math.abs
 
 /**
  * Battery-efficient OpenGL ES 2.0 renderer (RENDERMODE_WHEN_DIRTY) that turns a color photo +
- * GDepth map into a vivid, high-depth 3D parallax view driven by small phone tilts or finger drag.
+ * GDepth map into a vivid, high-depth 3D parallax view driven by touch drag and pinch-to-zoom.
  */
 class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
 
@@ -40,6 +40,12 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
         }
     }
 
+    fun setZoomAndPan(zoom: Float, panX: Float, panY: Float) {
+        if (renderer.setZoomAndPan(zoom, panX, panY)) {
+            requestRender()
+        }
+    }
+
     private class ParallaxMeshRenderer(
         private val onRequestNextFrame: () -> Unit
     ) : Renderer {
@@ -48,9 +54,18 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
         private var targetTiltX = 0f
         @Volatile
         private var targetTiltY = 0f
+        @Volatile
+        private var targetZoom = 1f
+        @Volatile
+        private var targetPanX = 0f
+        @Volatile
+        private var targetPanY = 0f
 
         private var currentTiltX = 0f
         private var currentTiltY = 0f
+        private var currentZoom = 1f
+        private var currentPanX = 0f
+        private var currentPanY = 0f
 
         private var pendingColor: Bitmap? = null
         private var pendingDepth: Bitmap? = null
@@ -74,6 +89,8 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
         private var uTiltLoc = 0
         private var uHasDepthLoc = 0
         private var uScaleLoc = 0
+        private var uZoomLoc = 0
+        private var uPanLoc = 0
 
         fun setTilt(tx: Float, ty: Float): Boolean {
             val clampedX = tx.coerceIn(-1f, 1f)
@@ -81,6 +98,19 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
             val changed = abs(clampedX - targetTiltX) > 0.002f || abs(clampedY - targetTiltY) > 0.002f
             targetTiltX = clampedX
             targetTiltY = clampedY
+            return changed
+        }
+
+        fun setZoomAndPan(zoom: Float, panX: Float, panY: Float): Boolean {
+            val clampedZoom = zoom.coerceIn(1f, 4f)
+            val clampedPanX = if (clampedZoom <= 1.01f) 0f else panX.coerceIn(-4f, 4f)
+            val clampedPanY = if (clampedZoom <= 1.01f) 0f else panY.coerceIn(-4f, 4f)
+            val changed = abs(clampedZoom - targetZoom) > 0.002f ||
+                abs(clampedPanX - targetPanX) > 0.002f ||
+                abs(clampedPanY - targetPanY) > 0.002f
+            targetZoom = clampedZoom
+            targetPanX = clampedPanX
+            targetPanY = clampedPanY
             return changed
         }
 
@@ -110,6 +140,8 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
             uTiltLoc = GLES20.glGetUniformLocation(program, "uTilt")
             uHasDepthLoc = GLES20.glGetUniformLocation(program, "uHasDepth")
             uScaleLoc = GLES20.glGetUniformLocation(program, "uAspectScale")
+            uZoomLoc = GLES20.glGetUniformLocation(program, "uZoom")
+            uPanLoc = GLES20.glGetUniformLocation(program, "uPan")
 
             val texIds = IntArray(2)
             GLES20.glGenTextures(2, texIds, 0)
@@ -142,8 +174,17 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
                 pendingDepth = null
             }
 
-            currentTiltX += (targetTiltX - currentTiltX) * 0.28f
-            currentTiltY += (targetTiltY - currentTiltY) * 0.28f
+            currentTiltX += (targetTiltX - currentTiltX) * 0.30f
+            currentTiltY += (targetTiltY - currentTiltY) * 0.30f
+            currentZoom += (targetZoom - currentZoom) * 0.36f
+            currentPanX += (targetPanX - currentPanX) * 0.36f
+            currentPanY += (targetPanY - currentPanY) * 0.36f
+
+            if (abs(targetTiltX - currentTiltX) < 0.001f) currentTiltX = targetTiltX
+            if (abs(targetTiltY - currentTiltY) < 0.001f) currentTiltY = targetTiltY
+            if (abs(targetZoom - currentZoom) < 0.001f) currentZoom = targetZoom
+            if (abs(targetPanX - currentPanX) < 0.001f) currentPanX = targetPanX
+            if (abs(targetPanY - currentPanY) < 0.001f) currentPanY = targetPanY
 
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
             if (colorTexId == 0) return
@@ -161,9 +202,16 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
             }
             // Overscan keeps edge-pinning zone cleanly outside the visible viewport so edges don't warp
             val overscan = if (hasDepthMap) 1.16f else 1.0f
+            val maxPanX = if (currentZoom <= 1.01f) 0f else (scaleX * overscan * currentZoom - 1.0f).coerceAtLeast(0f)
+            val maxPanY = if (currentZoom <= 1.01f) 0f else (scaleY * overscan * currentZoom - 1.0f).coerceAtLeast(0f)
+            val effectivePanX = currentPanX.coerceIn(-maxPanX, maxPanX)
+            val effectivePanY = currentPanY.coerceIn(-maxPanY, maxPanY)
+
             GLES20.glUniform2f(uScaleLoc, scaleX * overscan, scaleY * overscan)
             GLES20.glUniform2f(uTiltLoc, currentTiltX, currentTiltY)
             GLES20.glUniform1f(uHasDepthLoc, if (hasDepthMap) 1.0f else 0.0f)
+            GLES20.glUniform1f(uZoomLoc, currentZoom)
+            GLES20.glUniform2f(uPanLoc, effectivePanX, effectivePanY)
 
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, colorTexId)
@@ -188,8 +236,13 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
             GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
 
-            // Only schedule another GPU frame while converging toward target tilt
-            if (abs(targetTiltX - currentTiltX) > 0.002f || abs(targetTiltY - currentTiltY) > 0.002f) {
+            // Only schedule another GPU frame while converging toward target look/zoom/pan
+            val stillConverging = abs(targetTiltX - currentTiltX) > 0.002f ||
+                abs(targetTiltY - currentTiltY) > 0.002f ||
+                abs(targetZoom - currentZoom) > 0.002f ||
+                abs(targetPanX - currentPanX) > 0.002f ||
+                abs(targetPanY - currentPanY) > 0.002f
+            if (stillConverging) {
                 onRequestNextFrame()
             }
         }
@@ -275,6 +328,8 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
                 uniform vec2 uTilt;
                 uniform float uHasDepth;
                 uniform vec2 uAspectScale;
+                uniform float uZoom;
+                uniform vec2 uPan;
                 varying vec2 vTexCoord;
 
                 void main() {
@@ -289,7 +344,7 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
                     float centeredDepth = d - 0.36;
                     vec2 offset = vec2(uTilt.x, -uTilt.y) * centeredDepth * parallaxAmp;
 
-                    vec2 pos = (aPosition + offset) * uAspectScale;
+                    vec2 pos = ((aPosition + offset) * uAspectScale) * uZoom + uPan;
                     float zOrder = (uHasDepth > 0.5) ? (1.0 - d) * 0.8 : 0.0;
                     gl_Position = vec4(pos, zOrder, 1.0);
                 }

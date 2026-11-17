@@ -91,7 +91,8 @@ private data class StagedFrame(
     val nx: Float,
     val ny: Float,
     val gyroMag: Float,
-    val tiltDeg: Float
+    val tiltDeg: Float,
+    val frameQuality: Float
 )
 
 class CaptureViewModel(application: Application) : AndroidViewModel(application) {
@@ -265,6 +266,11 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         } else {
             0f
         }
+        val avgFrameQual = if (framePool.isNotEmpty()) {
+            framePool.map { it.frameQuality }.average().toFloat()
+        } else {
+            0.7f
+        }
         val hasMetric = framePool.any { it.depthBuffer != null }
         val spanX = maxNx - minNx
         val spanY = maxNy - minNy
@@ -274,7 +280,8 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             spanY = spanY,
             avgTileDetail = avgTileDetail,
             avgGyroMag = avgGyro,
-            hasMetricDepthFrames = hasMetric
+            hasMetricDepthFrames = hasMetric,
+            avgFrameQuality = avgFrameQual
         )
     }
 
@@ -381,9 +388,9 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             val elapsed = now - lastGrabAtMs
             val earlyRamp = framePool.size < 6 && elapsed >= 170L && (minExistingDist >= 0.10f || minAngleDelta >= 2.0f)
             val newRegion = elapsed >= 160L && (minExistingDist >= 0.18f || minAngleDelta >= 3.2f)
-            val periodicRefresh = elapsed >= 550L && framePool.size < MAX_FRAME_POOL
+            val upgradeProbe = elapsed >= 230L && motion.gyroMagnitudeRadPerSec < 1.15f
 
-            if (earlyRamp || newRegion || periodicRefresh) {
+            if (earlyRamp || newRegion || upgradeProbe) {
                 triggerFrameGrab(nx = nx, ny = ny)
             }
         }
@@ -492,6 +499,14 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 return@post
             }
 
+            val sharpness = SmartCaptureHelpers.measureBitmapSharpness(frame.colorBitmap)
+            val depthCoverage = measureDepthCoverage(frame.depthBuffer)
+            val candQuality = computeSingleFrameQualityMetric(
+                sharpness = sharpness,
+                gyroMag = motion.gyroMagnitudeRadPerSec,
+                tiltDeg = activeTiltDeg,
+                depthCoverage = depthCoverage
+            )
             val candidate = StagedFrame(
                 colorBitmap = frame.colorBitmap,
                 depthBuffer = frame.depthBuffer,
@@ -508,7 +523,8 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 nx = pendingGrabNx,
                 ny = pendingGrabNy,
                 gyroMag = motion.gyroMagnitudeRadPerSec,
-                tiltDeg = activeTiltDeg
+                tiltDeg = activeTiltDeg,
+                frameQuality = candQuality
             )
 
             // Credit detail right under this frame AND bridge in-between overlap from nearby frames
@@ -545,22 +561,42 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
 
-            if (framePool.size < MAX_FRAME_POOL) {
+            // Always prefer better-quality present frame over a weaker previous frame at the same viewpoint
+            var closestIdx = -1
+            var closestNormDist = Float.MAX_VALUE
+            for (i in framePool.indices) {
+                val existing = framePool[i]
+                val posDist = hypot(candidate.nx - existing.nx, candidate.ny - existing.ny)
+                val dy = MotionSensorMonitor.wrapAngleDelta(candidate.aimYawDeg, existing.aimYawDeg)
+                val dp = MotionSensorMonitor.wrapAngleDelta(candidate.aimUpDeg, existing.aimUpDeg)
+                val angDist = hypot(dy, dp) / 14f
+                val combined = posDist + angDist * 0.5f
+                if (combined < closestNormDist) {
+                    closestNormDist = combined
+                    closestIdx = i
+                }
+            }
+
+            if (closestIdx >= 0 && closestNormDist < SAME_VIEWPOINT_THRESHOLD) {
+                val prev = framePool[closestIdx]
+                if (shouldReplaceWithBetterFrame(candidate.frameQuality, prev.frameQuality)) {
+                    prev.colorBitmap.recycle()
+                    framePool[closestIdx] = candidate
+                } else {
+                    candidate.colorBitmap.recycle()
+                }
+            } else if (framePool.size < MAX_FRAME_POOL) {
                 framePool.add(candidate)
             } else {
-                // Keep crispest, well-spread frames by replacing closest less-steady frame
-                val closestIdx = framePool.indices.minByOrNull { i ->
-                    hypot(framePool[i].nx - candidate.nx, framePool[i].ny - candidate.ny)
-                } ?: -1
-                val candPenalty = candidate.gyroMag + candidate.tiltDeg * 0.08f
-                val prevPenalty = if (closestIdx >= 0) {
-                    framePool[closestIdx].gyroMag + framePool[closestIdx].tiltDeg * 0.08f
+                // Keep crispest, well-spread frames by upgrading closest or weakest slot when present shot is better
+                val replaceIdx = if (closestIdx >= 0 && closestNormDist < 0.45f) {
+                    closestIdx
                 } else {
-                    0f
+                    framePool.indices.minByOrNull { framePool[it].frameQuality } ?: -1
                 }
-                if (closestIdx >= 0 && candPenalty + 0.08f < prevPenalty) {
-                    framePool[closestIdx].colorBitmap.recycle()
-                    framePool[closestIdx] = candidate
+                if (replaceIdx >= 0 && shouldReplaceWithBetterFrame(candidate.frameQuality, framePool[replaceIdx].frameQuality)) {
+                    framePool[replaceIdx].colorBitmap.recycle()
+                    framePool[replaceIdx] = candidate
                 } else {
                     candidate.colorBitmap.recycle()
                 }
@@ -599,15 +635,12 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             try {
                 val staged = withContext(Dispatchers.Default) {
-                    // Pick the single sharpest, centered, steady frame as the Hero optical reference
+                    // Pick the single sharpest, centered, highest-quality frame as the Hero optical reference
                     val hasAnyMetricDepth = framesSnapshot.any { it.depthBuffer != null }
                     val hero = framesSnapshot.maxByOrNull { f ->
-                        val sharpness = SmartCaptureHelpers.measureBitmapSharpness(f.colorBitmap)
                         val centerScore = 1f / (1f + hypot(f.nx, f.ny) * 1.4f)
-                        val steadyScore = 1f / (1f + f.gyroMag * 2.0f)
-                        val levelScore = 1f / (1f + f.tiltDeg * 0.35f)
                         val depthBonus = if (!hasAnyMetricDepth || f.depthBuffer != null) 1.25f else 0.7f
-                        (sharpness + 10f) * centerScore * steadyScore * levelScore * depthBonus
+                        (f.frameQuality + 0.15f) * centerScore * depthBonus
                     } ?: framesSnapshot.first()
 
                     data class AlignedNeighbor(
@@ -850,6 +883,27 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         super.onCleared()
     }
 
+    private fun measureDepthCoverage(buffer: Depth16Buffer?): Float {
+        if (buffer == null || buffer.width <= 0 || buffer.height <= 0 || buffer.millimeters.isEmpty()) return 0f
+        val stepX = max(1, buffer.width / 16)
+        val stepY = max(1, buffer.height / 16)
+        var valid = 0
+        var total = 0
+        var y = stepY / 2
+        while (y < buffer.height) {
+            val rowOff = y * buffer.width
+            var x = stepX / 2
+            while (x < buffer.width) {
+                val d = buffer.millimeters[rowOff + x].toInt() and 0xFFFF
+                if (d in 150..12000) valid++
+                total++
+                x += stepX
+            }
+            y += stepY
+        }
+        return if (total > 0) valid.toFloat() / total else 0f
+    }
+
     companion object {
         const val GRID_COLS = 3
         const val GRID_ROWS = 3
@@ -858,6 +912,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
 
         private const val MIN_FRAMES_TO_ACCEPT = 2
         private const val MAX_FRAME_POOL = 14
+        private const val SAME_VIEWPOINT_THRESHOLD = 0.24f
         private const val TILT_LEVEL_TOLERANCE_DEG = 4.2f
         private const val MAX_CAPTURE_GYRO_RAD_PER_SEC = 1.35f
 
@@ -876,13 +931,33 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             return brushCol to brushRow
         }
 
+        internal fun computeSingleFrameQualityMetric(
+            sharpness: Float,
+            gyroMag: Float,
+            tiltDeg: Float,
+            depthCoverage: Float
+        ): Float {
+            val sharpnessNorm = (sharpness / 36f).coerceIn(0f, 1.5f)
+            val steadyNorm = 1f / (1f + gyroMag.coerceAtLeast(0f) * 2.2f)
+            val levelNorm = 1f / (1f + tiltDeg.coerceAtLeast(0f) * 0.22f)
+            val depthNorm = depthCoverage.coerceIn(0f, 1f)
+            return (0.42f * sharpnessNorm + 0.34f * steadyNorm + 0.14f * levelNorm + 0.10f * depthNorm)
+                .coerceIn(0f, 1.5f)
+        }
+
+        internal fun shouldReplaceWithBetterFrame(
+            candidateQuality: Float,
+            previousQuality: Float
+        ): Boolean = candidateQuality > previousQuality * 1.02f
+
         internal fun computeCaptureQualityScore(
             frameCount: Int,
             spanX: Float,
             spanY: Float,
             avgTileDetail: Float,
             avgGyroMag: Float,
-            hasMetricDepthFrames: Boolean
+            hasMetricDepthFrames: Boolean,
+            avgFrameQuality: Float = 0.7f
         ): Pair<Float, CaptureQualityTier> {
             if (frameCount <= 0) return 0f to CaptureQualityTier.POOR
             val frameScore = (frameCount / 7f).coerceIn(0f, 1f) * 0.32f
@@ -895,7 +970,8 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 frameCount >= 3 -> 0.05f
                 else -> 0f
             }
-            val score = (frameScore + hSpanScore + vSpanScore + coverageScore + steadyScore + depthBonus)
+            val frameQualityShift = (avgFrameQuality.coerceIn(0f, 1.2f) - 0.7f) * 0.12f
+            val score = (frameScore + hSpanScore + vSpanScore + coverageScore + steadyScore + depthBonus + frameQualityShift)
                 .coerceIn(0f, 1f)
             val tier = when {
                 score >= 0.82f -> CaptureQualityTier.EXCELLENT

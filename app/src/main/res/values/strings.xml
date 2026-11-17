@@ -25,9 +25,9 @@
     <string name="gallery_title">3D Photos</string>
     <string name="gallery_open_from_photos">Open Photo</string>
     <string name="gallery_empty_title">Capture your first 3D photo</string>
-    <string name="gallery_empty_subtitle">Point your camera, tap shutter, and move smoothly around the subject until quality reaches green—then tap Accept. Saved JPEGs look normal in Google Photos and tilt in 3D here.</string>
+    <string name="gallery_empty_subtitle">Point your camera, tap shutter, and move smoothly around the subject until quality turns green—then tap Accept. Drag to view 3D and pinch to zoom.</string>
     <string name="gallery_empty_cta">Take 3D Photo</string>
-    <string name="viewer_hint_tilt">Tilt phone or drag to look around in 3D</string>
+    <string name="viewer_hint_tilt">Drag to view 3D • Pinch to zoom</string>
     <string name="viewer_save_vr">Save 3D for VR</string>
     <string name="viewer_vr_saved">Saved Quest-ready SBS 3D photo to Pictures/3d Camera/VR Export</string>
     <string name="viewer_no_depth_notice">Standard flat photo — no 3D depth map found in this JPEG</string>
@@ -49,5 +49,5 @@
     <string name="review_retake">Retake</string>
     <string name="review_saving">Saving…</string>
     <string name="review_save">Save 3D Photo</string>
-    <string name="review_hint_tilt">Tilt or drag to experience 3D depth</string>
+    <string name="review_hint_tilt">Drag to look in 3D • Pinch to zoom • Double-tap to reset</string>
 </resources>

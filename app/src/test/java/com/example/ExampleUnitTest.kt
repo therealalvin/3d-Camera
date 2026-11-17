@@ -1,9 +1,12 @@
 package com.example
 
+import androidx.compose.ui.geometry.Offset
 import com.example.capture.CaptureQualityTier
 import com.example.capture.CaptureViewModel
 import com.example.capture.SmartCaptureHelpers
+import com.example.viewer.SpatialViewportState
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.sqrt
@@ -134,5 +137,72 @@ class ExampleUnitTest {
         )
         assertEquals(CaptureQualityTier.EXCELLENT, excTier)
         assertTrue(excScore >= 0.82f)
+    }
+
+    @Test
+    fun spatialViewportStateSupportsFingerDragLookPinchZoomAndReset() {
+        val state = SpatialViewportState()
+
+        // Drag right & down without zooming: shifts 3D look-around naturally, zoom stays 1f
+        state.applyTransform(
+            centroid = Offset(500f, 500f),
+            pan = Offset(170f, -85f),
+            zoomChange = 1f,
+            viewWidth = 1000f,
+            viewHeight = 2000f
+        )
+        assertEquals(0.5f, state.lookX, 0.01f)
+        assertEquals(-0.25f, state.lookY, 0.01f)
+        assertEquals(1f, state.zoom, 1e-4f)
+        assertEquals(0f, state.panX, 1e-4f)
+        assertEquals(0f, state.panY, 1e-4f)
+
+        // Pinch in 2.5x around top-left quadrant
+        state.applyTransform(
+            centroid = Offset(250f, 500f),
+            pan = Offset.Zero,
+            zoomChange = 2.5f,
+            viewWidth = 1000f,
+            viewHeight = 2000f
+        )
+        assertEquals(2.5f, state.zoom, 1e-4f)
+        assertTrue(state.panX != 0f || state.panY != 0f)
+
+        // Pinch out past minimum zoom: clamps to 1.0f and recenters pan
+        state.applyTransform(
+            centroid = Offset(500f, 1000f),
+            pan = Offset.Zero,
+            zoomChange = 0.2f,
+            viewWidth = 1000f,
+            viewHeight = 2000f
+        )
+        assertEquals(1f, state.zoom, 1e-4f)
+        assertEquals(0f, state.panX, 1e-4f)
+        assertEquals(0f, state.panY, 1e-4f)
+
+        // Reset restores centered neutral state
+        state.reset()
+        assertEquals(0f, state.lookX, 1e-4f)
+        assertEquals(0f, state.lookY, 1e-4f)
+        assertEquals(1f, state.zoom, 1e-4f)
+    }
+
+    @Test
+    fun computeSingleFrameQualityMetricPrefersSharperSteadierFrames() {
+        val blurryShaky = CaptureViewModel.computeSingleFrameQualityMetric(
+            sharpness = 9f,
+            gyroMag = 0.9f,
+            tiltDeg = 4.5f,
+            depthCoverage = 0.2f
+        )
+        val crispSteady = CaptureViewModel.computeSingleFrameQualityMetric(
+            sharpness = 28f,
+            gyroMag = 0.1f,
+            tiltDeg = 0.8f,
+            depthCoverage = 0.8f
+        )
+        assertTrue(crispSteady > blurryShaky)
+        assertTrue(CaptureViewModel.shouldReplaceWithBetterFrame(crispSteady, blurryShaky))
+        assertFalse(CaptureViewModel.shouldReplaceWithBetterFrame(blurryShaky, crispSteady))
     }
 }
