@@ -14,6 +14,18 @@
     <string name="capture_quality_good">Good</string>
     <string name="capture_quality_excellent">Excellent</string>
     <string name="capture_quality_summary">Quality: %1$s · %2$d%% (%3$d shots)</string>
+    <string name="capture_status_better">Better than before — upgraded</string>
+    <string name="capture_status_worse">Worse than before — kept sharper shot</string>
+    <string name="capture_weak_area_hint">Low detail: %1$s — move there</string>
+    <string name="capture_area_top_left">Top-Left</string>
+    <string name="capture_area_top">Top</string>
+    <string name="capture_area_top_right">Top-Right</string>
+    <string name="capture_area_left">Left</string>
+    <string name="capture_area_center">Center</string>
+    <string name="capture_area_right">Right</string>
+    <string name="capture_area_bottom_left">Bottom-Left</string>
+    <string name="capture_area_bottom">Bottom</string>
+    <string name="capture_area_bottom_right">Bottom-Right</string>
     <string name="capture_accept_button">Accept</string>
     <string name="capture_accept_sublabel">Create 3D</string>
     <string name="cd_accept_capture">Accept captured frames and create 3D photo</string>
@@ -25,9 +37,9 @@
     <string name="gallery_title">3D Photos</string>
     <string name="gallery_open_from_photos">Open Photo</string>
     <string name="gallery_empty_title">Capture your first 3D photo</string>
-    <string name="gallery_empty_subtitle">Point your camera, tap shutter, and move smoothly around the subject until quality turns green—then tap Accept. Drag to view 3D and pinch to zoom.</string>
+    <string name="gallery_empty_subtitle">Point your camera, tap shutter, and move smoothly around the subject until quality turns green—then tap Accept. Drag to tilt in 3D, twist to rotate, and pinch to zoom.</string>
     <string name="gallery_empty_cta">Take 3D Photo</string>
-    <string name="viewer_hint_tilt">Drag to view 3D • Pinch to zoom</string>
+    <string name="viewer_hint_tilt">Drag to tilt in 3D • Twist to rotate • Pinch to zoom</string>
     <string name="viewer_save_vr">Save 3D for VR</string>
     <string name="viewer_vr_saved">Saved Quest-ready SBS 3D photo to Pictures/3d Camera/VR Export</string>
     <string name="viewer_no_depth_notice">Standard flat photo — no 3D depth map found in this JPEG</string>
@@ -49,5 +61,5 @@
     <string name="review_retake">Retake</string>
     <string name="review_saving">Saving…</string>
     <string name="review_save">Save 3D Photo</string>
-    <string name="review_hint_tilt">Drag to look in 3D • Pinch to zoom • Double-tap to reset</string>
+    <string name="review_hint_tilt">Drag to tilt in 3D • Twist to rotate • Pinch to zoom</string>
 </resources>

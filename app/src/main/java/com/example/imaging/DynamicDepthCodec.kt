@@ -597,8 +597,9 @@ object DynamicDepthCodec {
     }
 
     /**
-     * Blends pose-rectified sweep frames onto stationary objects in the Hero RGB image with
-     * transparent-border gating and smooth spatial edge feathering for distortion-free output.
+     * Stacks the best aligned local patches across pose-rectified sweep frames onto the Hero canvas.
+     * Uses overlapping tent-feathered 24x24 patches so blurry regions of the Hero frame seamlessly
+     * adopt sharper aligned regions from other captured frames while gating out parallax/motion ghosting.
      */
     fun enhanceHeroWithAlignedFrames(
         heroBitmap: Bitmap,
@@ -613,13 +614,14 @@ object DynamicDepthCodec {
                     it.edgeMatchScore >= 0.35f
             }
             .sortedByDescending { it.edgeMatchScore }
-            .take(3)
+            .take(6)
             .toList()
         if (validSources.isEmpty()) return heroBitmap
 
         return blendAlignedBitmapsInternal(
             heroBitmap = heroBitmap,
-            sources = validSources.map { it.bitmap to it.edgeMatchScore }
+            sources = validSources.map { it.bitmap to it.edgeMatchScore },
+            preferSharpestPatches = true
         )
     }
 
@@ -637,15 +639,60 @@ object DynamicDepthCodec {
         if (sources.isEmpty()) return heroBitmap
         return blendAlignedBitmapsInternal(
             heroBitmap = heroBitmap,
-            sources = sources.map { it to 0.85f }
+            sources = sources.map { it to 0.85f },
+            preferSharpestPatches = false
         )
+    }
+
+    private fun computePatchEdgeEnergy(
+        pixels: IntArray,
+        w: Int,
+        h: Int,
+        bx: Int,
+        by: Int,
+        bw: Int,
+        bh: Int,
+        dxShift: Int = 0,
+        dyShift: Int = 0
+    ): Float {
+        var gradSum = 0f
+        var count = 0
+        var y = 2
+        while (y < bh - 2) {
+            val py = (by + y + dyShift).coerceIn(1, h - 2)
+            val row = py * w
+            val prevRow = (py - 1) * w
+            val nextRow = (py + 1) * w
+            var x = 2
+            while (x < bw - 2) {
+                val px = (bx + x + dxShift).coerceIn(1, w - 2)
+                val c = pixels[row + px]
+                if (((c ushr 24) and 0xFF) < 245) {
+                    x += 2
+                    continue
+                }
+                val cl = pixels[row + px - 1]
+                val cr = pixels[row + px + 1]
+                val cu = pixels[prevRow + px]
+                val cd = pixels[nextRow + px]
+                val gx = abs((((cr shr 16) and 0xFF) * 0.3f + ((cr shr 8) and 0xFF) * 0.59f + (cr and 0xFF) * 0.11f) -
+                    (((cl shr 16) and 0xFF) * 0.3f + ((cl shr 8) and 0xFF) * 0.59f + (cl and 0xFF) * 0.11f))
+                val gy = abs((((cd shr 16) and 0xFF) * 0.3f + ((cd shr 8) and 0xFF) * 0.59f + (cd and 0xFF) * 0.11f) -
+                    (((cu shr 16) and 0xFF) * 0.3f + ((cu shr 8) and 0xFF) * 0.59f + (cu and 0xFF) * 0.11f))
+                gradSum += (gx + gy) * 0.5f
+                count++
+                x += 2
+            }
+            y += 2
+        }
+        return if (count > 0) gradSum / count else 0f
     }
 
     private fun blendAlignedBitmapsInternal(
         heroBitmap: Bitmap,
-        sources: List<Pair<Bitmap, Float>>
+        sources: List<Pair<Bitmap, Float>>,
+        preferSharpestPatches: Boolean
     ): Bitmap {
-
         val w = heroBitmap.width
         val h = heroBitmap.height
         val heroPx = IntArray(w * h)
@@ -654,17 +701,18 @@ object DynamicDepthCodec {
         val sumR = FloatArray(w * h)
         val sumG = FloatArray(w * h)
         val sumB = FloatArray(w * h)
-        val heroWeight = 1.35f
-        val wSum = FloatArray(w * h) { heroWeight }
+        val heroBaseWeight = if (preferSharpestPatches) 1.0f else 1.35f
+        val wSum = FloatArray(w * h) { heroBaseWeight }
         for (i in heroPx.indices) {
             val c = heroPx[i]
-            sumR[i] = ((c shr 16) and 0xFF) * heroWeight
-            sumG[i] = ((c shr 8) and 0xFF) * heroWeight
-            sumB[i] = (c and 0xFF) * heroWeight
+            sumR[i] = ((c shr 16) and 0xFF) * heroBaseWeight
+            sumG[i] = ((c shr 8) and 0xFF) * heroBaseWeight
+            sumB[i] = (c and 0xFF) * heroBaseWeight
         }
 
         val nbPx = IntArray(w * h)
         val block = 24
+        val stride = if (preferSharpestPatches) 12 else 24
         val search = 5
         val edgeFeatherPx = 12f
 
@@ -676,7 +724,7 @@ object DynamicDepthCodec {
                 var bx = 0
                 while (bx < w) {
                     val bw = min(block, w - bx)
-                    // Find best fine integer shift (dx, dy) matching stationary detail inside this block
+                    // Find best fine integer shift (dx, dy) matching stationary detail inside this patch
                     var bestDx = 0
                     var bestDy = 0
                     var bestCost = Int.MAX_VALUE
@@ -720,13 +768,35 @@ object DynamicDepthCodec {
                         dy += 2
                     }
 
-                    // Gate out any block that shows residual skew, parallax shift, or blur mismatch
+                    // Gate out any patch that shows residual skew, parallax shift, or extreme mismatch
                     val avgBlockDiff = if (bestSamples > 0) bestCost.toFloat() / (bestSamples * 3f) else Float.MAX_VALUE
-                    if (avgBlockDiff <= 12f) {
+                    val maxAllowedDiff = if (preferSharpestPatches) 16f else 12f
+                    if (avgBlockDiff <= maxAllowedDiff) {
+                        val patchQualityFactor = if (preferSharpestPatches) {
+                            val heroSharp = computePatchEdgeEnergy(heroPx, w, h, bx, by, bw, bh, 0, 0)
+                            val nbSharp = computePatchEdgeEnergy(nbPx, w, h, bx, by, bw, bh, bestDx, bestDy)
+                            val ratio = nbSharp / max(3.5f, heroSharp)
+                            when {
+                                ratio >= 1.12f -> ratio.coerceIn(1.15f, 3.0f)
+                                ratio <= 0.68f -> 0.25f
+                                else -> 1.0f
+                            }
+                        } else {
+                            1.0f
+                        }
+
+                        val maxColorDiff = if (preferSharpestPatches && patchQualityFactor > 1.25f) 24 else 14
+                        val halfW = max(1f, bw * 0.5f)
+                        val halfH = max(1f, bh * 0.5f)
                         for (py in by until by + bh) {
                             val ny = py + bestDy
                             if (ny !in 0 until h) continue
                             val distY = min(ny, h - 1 - ny).toFloat()
+                            val tentY = if (preferSharpestPatches) {
+                                (1f - abs((py - by) + 0.5f - halfH) / halfH).coerceIn(0.15f, 1f)
+                            } else {
+                                1f
+                            }
                             val hRow = py * w
                             val nRow = ny * w
                             for (px in bx until bx + bw) {
@@ -744,10 +814,17 @@ object DynamicDepthCodec {
                                     abs(((hc shr 16) and 0xFF) - nr),
                                     max(abs(((hc shr 8) and 0xFF) - ng), abs((hc and 0xFF) - nbCol))
                                 )
-                                if (diffMax <= 14) {
+                                if (diffMax <= maxColorDiff) {
+                                    val tentX = if (preferSharpestPatches) {
+                                        (1f - abs((px - bx) + 0.5f - halfW) / halfW).coerceIn(0.15f, 1f)
+                                    } else {
+                                        1f
+                                    }
                                     val distEdge = min(distY, min(nx, w - 1 - nx).toFloat())
                                     val borderFade = (distEdge / edgeFeatherPx).coerceIn(0.15f, 1f)
-                                    val wPix = (1f - (diffMax / 18f)) * borderFade * frameScore.coerceIn(0.4f, 1f)
+                                    val colorAgreement = (1f - (diffMax / (maxColorDiff + 6f))).coerceIn(0.15f, 1f)
+                                    val wPix = colorAgreement * borderFade * frameScore.coerceIn(0.4f, 1f) *
+                                        patchQualityFactor * tentX * tentY
                                     sumR[idx] += nr * wPix
                                     sumG[idx] += ng * wPix
                                     sumB[idx] += nbCol * wPix
@@ -756,9 +833,9 @@ object DynamicDepthCodec {
                             }
                         }
                     }
-                    bx += block
+                    bx += stride
                 }
-                by += block
+                by += stride
             }
         }
 

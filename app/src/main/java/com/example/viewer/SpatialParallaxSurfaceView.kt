@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
+import android.opengl.Matrix
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -12,10 +13,14 @@ import java.nio.ShortBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.tan
 
 /**
- * Battery-efficient OpenGL ES 2.0 renderer (RENDERMODE_WHEN_DIRTY) that turns a color photo +
- * GDepth map into a vivid, high-depth 3D parallax view driven by touch drag and pinch-to-zoom.
+ * Battery-efficient OpenGL ES 2.0 3D perspective renderer (RENDERMODE_WHEN_DIRTY) that turns
+ * a color photo + GDepth map into a cohesive 3D relief scene you can tilt, rotate, and zoom
+ * in 3D space without rubbery image mutation.
  */
 class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
 
@@ -40,6 +45,12 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
         }
     }
 
+    fun setRollDegrees(rollDeg: Float) {
+        if (renderer.setRollDegrees(rollDeg)) {
+            requestRender()
+        }
+    }
+
     fun setZoomAndPan(zoom: Float, panX: Float, panY: Float) {
         if (renderer.setZoomAndPan(zoom, panX, panY)) {
             requestRender()
@@ -55,6 +66,8 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
         @Volatile
         private var targetTiltY = 0f
         @Volatile
+        private var targetRollDeg = 0f
+        @Volatile
         private var targetZoom = 1f
         @Volatile
         private var targetPanX = 0f
@@ -63,6 +76,7 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
 
         private var currentTiltX = 0f
         private var currentTiltY = 0f
+        private var currentRollDeg = 0f
         private var currentZoom = 1f
         private var currentPanX = 0f
         private var currentPanY = 0f
@@ -86,11 +100,18 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
         private var aUvLoc = 0
         private var uColorTexLoc = 0
         private var uDepthTexLoc = 0
-        private var uTiltLoc = 0
+        private var uMvpMatrixLoc = 0
         private var uHasDepthLoc = 0
-        private var uScaleLoc = 0
+        private var uCardExtentsLoc = 0
+        private var uReliefDepthLoc = 0
         private var uZoomLoc = 0
         private var uPanLoc = 0
+
+        private val projMatrix = FloatArray(16)
+        private val viewMatrix = FloatArray(16)
+        private val modelMatrix = FloatArray(16)
+        private val mvMatrix = FloatArray(16)
+        private val mvpMatrix = FloatArray(16)
 
         fun setTilt(tx: Float, ty: Float): Boolean {
             val clampedX = tx.coerceIn(-1f, 1f)
@@ -98,6 +119,14 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
             val changed = abs(clampedX - targetTiltX) > 0.002f || abs(clampedY - targetTiltY) > 0.002f
             targetTiltX = clampedX
             targetTiltY = clampedY
+            return changed
+        }
+
+        fun setRollDegrees(rollDeg: Float): Boolean {
+            val wrapped = SpatialViewportState.wrapRollDegrees(rollDeg)
+            val delta = abs(((wrapped - targetRollDeg + 540f) % 360f) - 180f)
+            val changed = delta > 0.08f
+            targetRollDeg = wrapped
             return changed
         }
 
@@ -137,9 +166,10 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
             aUvLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
             uColorTexLoc = GLES20.glGetUniformLocation(program, "uColorTex")
             uDepthTexLoc = GLES20.glGetUniformLocation(program, "uDepthTex")
-            uTiltLoc = GLES20.glGetUniformLocation(program, "uTilt")
+            uMvpMatrixLoc = GLES20.glGetUniformLocation(program, "uMvpMatrix")
             uHasDepthLoc = GLES20.glGetUniformLocation(program, "uHasDepth")
-            uScaleLoc = GLES20.glGetUniformLocation(program, "uAspectScale")
+            uCardExtentsLoc = GLES20.glGetUniformLocation(program, "uCardExtents")
+            uReliefDepthLoc = GLES20.glGetUniformLocation(program, "uReliefDepth")
             uZoomLoc = GLES20.glGetUniformLocation(program, "uZoom")
             uPanLoc = GLES20.glGetUniformLocation(program, "uPan")
 
@@ -153,7 +183,7 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
 
         override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
             GLES20.glViewport(0, 0, width, height)
-            viewAspect = width.toFloat() / height.coerceAtLeast(1)
+            viewAspect = (width.toFloat() / height.coerceAtLeast(1)).coerceAtLeast(0.1f)
             onRequestNextFrame()
         }
 
@@ -176,12 +206,15 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
 
             currentTiltX += (targetTiltX - currentTiltX) * 0.30f
             currentTiltY += (targetTiltY - currentTiltY) * 0.30f
+            val rollDelta = ((targetRollDeg - currentRollDeg + 540f) % 360f) - 180f
+            currentRollDeg = SpatialViewportState.wrapRollDegrees(currentRollDeg + rollDelta * 0.34f)
             currentZoom += (targetZoom - currentZoom) * 0.36f
             currentPanX += (targetPanX - currentPanX) * 0.36f
             currentPanY += (targetPanY - currentPanY) * 0.36f
 
             if (abs(targetTiltX - currentTiltX) < 0.001f) currentTiltX = targetTiltX
             if (abs(targetTiltY - currentTiltY) < 0.001f) currentTiltY = targetTiltY
+            if (abs(rollDelta) < 0.05f) currentRollDeg = targetRollDeg
             if (abs(targetZoom - currentZoom) < 0.001f) currentZoom = targetZoom
             if (abs(targetPanX - currentPanX) < 0.001f) currentPanX = targetPanX
             if (abs(targetPanY - currentPanY) < 0.001f) currentPanY = targetPanY
@@ -191,25 +224,50 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
 
             GLES20.glUseProgram(program)
 
-            val scaleX: Float
-            val scaleY: Float
+            // True 3D perspective camera framing the image plane at Z = 0
+            val fovDeg = 40f
+            val eyeZ = 2.85f
+            val tanHalfFovY = tan(Math.toRadians(fovDeg * 0.5)).toFloat()
+            val frustumHalfH = eyeZ * tanHalfFovY
+            val frustumHalfW = frustumHalfH * viewAspect
+
+            val baseHalfW: Float
+            val baseHalfH: Float
             if (imageAspect > viewAspect) {
-                scaleX = 1.0f
-                scaleY = viewAspect / imageAspect
+                baseHalfW = frustumHalfW
+                baseHalfH = frustumHalfW / imageAspect
             } else {
-                scaleX = imageAspect / viewAspect
-                scaleY = 1.0f
+                baseHalfH = frustumHalfH
+                baseHalfW = frustumHalfH * imageAspect
             }
-            // Overscan keeps edge-pinning zone cleanly outside the visible viewport so edges don't warp
-            val overscan = if (hasDepthMap) 1.16f else 1.0f
-            val maxPanX = if (currentZoom <= 1.01f) 0f else (scaleX * overscan * currentZoom - 1.0f).coerceAtLeast(0f)
-            val maxPanY = if (currentZoom <= 1.01f) 0f else (scaleY * overscan * currentZoom - 1.0f).coerceAtLeast(0f)
+
+            // Slight pullback when actively tilted in 3D so perspective corners stay framed cleanly
+            val tiltIntensity = max(abs(currentTiltX), abs(currentTiltY))
+            val cardScale = 1.0f - 0.07f * tiltIntensity
+
+            Matrix.perspectiveM(projMatrix, 0, fovDeg, viewAspect, 0.5f, 12f)
+            Matrix.setLookAtM(viewMatrix, 0, 0f, 0f, eyeZ, 0f, 0f, 0f, 0f, 1f, 0f)
+
+            Matrix.setIdentityM(modelMatrix, 0)
+            // Apply screen-plane pitch & yaw first in view orientation, then 3D in-plane roll
+            Matrix.rotateM(modelMatrix, 0, currentTiltY * 22f, 1f, 0f, 0f)
+            Matrix.rotateM(modelMatrix, 0, currentTiltX * 26f, 0f, 1f, 0f)
+            Matrix.rotateM(modelMatrix, 0, -currentRollDeg, 0f, 0f, 1f)
+            Matrix.scaleM(modelMatrix, 0, cardScale, cardScale, 1f)
+
+            Matrix.multiplyMM(mvMatrix, 0, viewMatrix, 0, modelMatrix, 0)
+            Matrix.multiplyMM(mvpMatrix, 0, projMatrix, 0, mvMatrix, 0)
+
+            val reliefDepth = if (hasDepthMap) 0.25f * min(baseHalfW, baseHalfH) else 0f
+            val maxPanX = if (currentZoom <= 1.01f) 0f else ((baseHalfW / frustumHalfW) * currentZoom - 1.0f).coerceAtLeast(0f)
+            val maxPanY = if (currentZoom <= 1.01f) 0f else ((baseHalfH / frustumHalfH) * currentZoom - 1.0f).coerceAtLeast(0f)
             val effectivePanX = currentPanX.coerceIn(-maxPanX, maxPanX)
             val effectivePanY = currentPanY.coerceIn(-maxPanY, maxPanY)
 
-            GLES20.glUniform2f(uScaleLoc, scaleX * overscan, scaleY * overscan)
-            GLES20.glUniform2f(uTiltLoc, currentTiltX, currentTiltY)
+            GLES20.glUniformMatrix4fv(uMvpMatrixLoc, 1, false, mvpMatrix, 0)
             GLES20.glUniform1f(uHasDepthLoc, if (hasDepthMap) 1.0f else 0.0f)
+            GLES20.glUniform2f(uCardExtentsLoc, baseHalfW, baseHalfH)
+            GLES20.glUniform1f(uReliefDepthLoc, reliefDepth)
             GLES20.glUniform1f(uZoomLoc, currentZoom)
             GLES20.glUniform2f(uPanLoc, effectivePanX, effectivePanY)
 
@@ -236,9 +294,11 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
             GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
 
-            // Only schedule another GPU frame while converging toward target look/zoom/pan
+            // Only schedule another GPU frame while converging toward target 3D orientation or zoom/pan
+            val rollStillMoving = abs(((targetRollDeg - currentRollDeg + 540f) % 360f) - 180f) > 0.08f
             val stillConverging = abs(targetTiltX - currentTiltX) > 0.002f ||
                 abs(targetTiltY - currentTiltY) > 0.002f ||
+                rollStillMoving ||
                 abs(targetZoom - currentZoom) > 0.002f ||
                 abs(targetPanX - currentPanX) > 0.002f ||
                 abs(targetPanY - currentPanY) > 0.002f
@@ -325,28 +385,39 @@ class SpatialParallaxSurfaceView(context: Context) : GLSurfaceView(context) {
                 attribute vec2 aPosition;
                 attribute vec2 aTexCoord;
                 uniform sampler2D uDepthTex;
-                uniform vec2 uTilt;
+                uniform mat4 uMvpMatrix;
                 uniform float uHasDepth;
-                uniform vec2 uAspectScale;
+                uniform vec2 uCardExtents;
+                uniform float uReliefDepth;
                 uniform float uZoom;
                 uniform vec2 uPan;
                 varying vec2 vTexCoord;
 
+                float sampleSmoothDepth(vec2 uv) {
+                    float c = texture2D(uDepthTex, uv).r;
+                    float o = 0.0065;
+                    float n = texture2D(uDepthTex, clamp(uv + vec2(0.0, -o), 0.0, 1.0)).r;
+                    float s = texture2D(uDepthTex, clamp(uv + vec2(0.0,  o), 0.0, 1.0)).r;
+                    float e = texture2D(uDepthTex, clamp(uv + vec2( o, 0.0), 0.0, 1.0)).r;
+                    float w = texture2D(uDepthTex, clamp(uv + vec2(-o, 0.0), 0.0, 1.0)).r;
+                    return c * 0.44 + (n + s + e + w) * 0.14;
+                }
+
                 void main() {
                     vTexCoord = aTexCoord;
-                    float d = (uHasDepth > 0.5) ? texture2D(uDepthTex, aTexCoord).r : 0.0;
-                    // Smooth monotonic border anchor (0..6%) keeps max compression < 1.0 so foreground edges never fold
-                    float edgeX = smoothstep(0.0, 0.060, aTexCoord.x) * smoothstep(1.0, 0.940, aTexCoord.x);
-                    float edgeY = smoothstep(0.0, 0.060, aTexCoord.y) * smoothstep(1.0, 0.940, aTexCoord.y);
-                    float edgePin = min(edgeX, edgeY);
+                    float d = (uHasDepth > 0.5) ? sampleSmoothDepth(aTexCoord) : 0.0;
+                    // Anchor only the outer 2.5% perimeter onto the 3D plane so tilted borders stay crisp
+                    float borderX = smoothstep(0.0, 0.025, aTexCoord.x) * smoothstep(1.0, 0.975, aTexCoord.x);
+                    float borderY = smoothstep(0.0, 0.025, aTexCoord.y) * smoothstep(1.0, 0.975, aTexCoord.y);
+                    float borderMask = min(borderX, borderY);
 
-                    float parallaxAmp = 0.175 * uHasDepth * edgePin;
-                    float centeredDepth = d - 0.36;
-                    vec2 offset = vec2(uTilt.x, -uTilt.y) * centeredDepth * parallaxAmp;
+                    float localX = aPosition.x * uCardExtents.x;
+                    float localY = aPosition.y * uCardExtents.y;
+                    float localZ = (d - 0.36) * uReliefDepth * borderMask;
 
-                    vec2 pos = ((aPosition + offset) * uAspectScale) * uZoom + uPan;
-                    float zOrder = (uHasDepth > 0.5) ? (1.0 - d) * 0.8 : 0.0;
-                    gl_Position = vec4(pos, zOrder, 1.0);
+                    vec4 clip = uMvpMatrix * vec4(localX, localY, localZ, 1.0);
+                    clip.xy = clip.xy * uZoom + uPan * clip.w;
+                    gl_Position = clip;
                 }
             """
 

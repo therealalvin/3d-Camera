@@ -118,6 +118,10 @@ fun ReviewPhotoScreen(
         glSurfaceView.setTiltOffset(viewportState.lookX, viewportState.lookY)
     }
 
+    LaunchedEffect(viewportState.rollDeg) {
+        glSurfaceView.setRollDegrees(viewportState.rollDeg)
+    }
+
     LaunchedEffect(viewportState.zoom, viewportState.panX, viewportState.panY) {
         glSurfaceView.setZoomAndPan(viewportState.zoom, viewportState.panX, viewportState.panY)
     }

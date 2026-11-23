@@ -45,6 +45,12 @@ enum class CaptureQualityTier {
     EXCELLENT
 }
 
+enum class FrameComparisonStatus {
+    NONE,
+    BETTER,
+    WORSE
+}
+
 data class StagedCapture(
     val heroBitmap: Bitmap,
     val depthResult: RefinedDepthResult,
@@ -54,6 +60,9 @@ data class StagedCapture(
 data class CaptureUiState(
     val phase: CapturePhase = CapturePhase.READY,
     val tileDetails: List<Float> = List(CaptureViewModel.TILE_COUNT) { 0f },
+    val tileQualities: List<Float> = List(CaptureViewModel.TILE_COUNT) { 0f },
+    val weakestAreaIndex: Int? = null,
+    val lastFrameComparison: FrameComparisonStatus = FrameComparisonStatus.NONE,
     val clearedTilesCount: Int = 0,
     val detailPercent: Int = 0,
     val capturedFrameCount: Int = 0,
@@ -92,7 +101,8 @@ private data class StagedFrame(
     val ny: Float,
     val gyroMag: Float,
     val tiltDeg: Float,
-    val frameQuality: Float
+    val frameQuality: Float,
+    val patchQualities: FloatArray
 )
 
 class CaptureViewModel(application: Application) : AndroidViewModel(application) {
@@ -114,6 +124,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val framePool = mutableListOf<StagedFrame>()
     private val tileProgress = FloatArray(TILE_COUNT)
+    private val bestTileQuality = FloatArray(TILE_COUNT)
 
     private var sensorJob: Job? = null
     private var originArPose: LivePoseSnapshot? = null
@@ -252,6 +263,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         minNy = 0f
         maxNy = 0f
         tileProgress.fill(0f)
+        bestTileQuality.fill(0f)
         grabInFlight = false
         pendingGrabNx = 0f
         pendingGrabNy = 0f
@@ -403,6 +415,9 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         _uiState.value = _uiState.value.copy(
             phase = CapturePhase.SWEEPING,
             tileDetails = List(TILE_COUNT) { 0f },
+            tileQualities = List(TILE_COUNT) { 0f },
+            weakestAreaIndex = null,
+            lastFrameComparison = FrameComparisonStatus.NONE,
             clearedTilesCount = 0,
             detailPercent = 0,
             capturedFrameCount = 0,
@@ -427,6 +442,9 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         _uiState.value = _uiState.value.copy(
             phase = CapturePhase.READY,
             tileDetails = List(TILE_COUNT) { 0f },
+            tileQualities = List(TILE_COUNT) { 0f },
+            weakestAreaIndex = null,
+            lastFrameComparison = FrameComparisonStatus.NONE,
             clearedTilesCount = 0,
             detailPercent = 0,
             capturedFrameCount = 0,
@@ -496,6 +514,9 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             // Reject extreme motion blur spikes once we already have a baseline frame
             if (motion.gyroMagnitudeRadPerSec > 1.75f && framePool.isNotEmpty()) {
                 frame.colorBitmap.recycle()
+                _uiState.value = _uiState.value.copy(
+                    lastFrameComparison = FrameComparisonStatus.WORSE
+                )
                 return@post
             }
 
@@ -507,6 +528,18 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 tiltDeg = activeTiltDeg,
                 depthCoverage = depthCoverage
             )
+            val patchSharp = SmartCaptureHelpers.measureGridPatchSharpness(frame.colorBitmap, GRID_COLS, GRID_ROWS)
+            val patchDepth = frame.depthBuffer?.let {
+                SmartCaptureHelpers.computeTileDepthDensities(it.millimeters, it.width, it.height, GRID_COLS, GRID_ROWS)
+            }
+            val steadyFactor = (1f / (1f + motion.gyroMagnitudeRadPerSec.coerceAtLeast(0f) * 2.0f)).coerceIn(0f, 1f)
+            val levelFactor = (1f / (1f + activeTiltDeg.coerceAtLeast(0f) * 0.20f)).coerceIn(0f, 1f)
+            val patchQualities = FloatArray(TILE_COUNT) { idx ->
+                val depthPart = patchDepth?.get(idx) ?: 0.55f
+                (0.45f * patchSharp[idx] + 0.33f * steadyFactor + 0.14f * levelFactor + 0.08f * depthPart)
+                    .coerceIn(0f, 1f)
+            }
+
             val candidate = StagedFrame(
                 colorBitmap = frame.colorBitmap,
                 depthBuffer = frame.depthBuffer,
@@ -524,11 +557,14 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 ny = pendingGrabNy,
                 gyroMag = motion.gyroMagnitudeRadPerSec,
                 tiltDeg = activeTiltDeg,
-                frameQuality = candQuality
+                frameQuality = candQuality,
+                patchQualities = patchQualities
             )
 
-            // Credit detail right under this frame AND bridge in-between overlap from nearby frames
+            // Credit detail and local per-area quality right under this frame
             val (bCol, bRow) = computeBrushGridPos(candidate.nx, candidate.ny, GRID_COLS, GRID_ROWS)
+            var improvedExistingTile = false
+            var aimedOverVisitedTile = false
             for (r in 0 until GRID_ROWS) {
                 for (c in 0 until GRID_COLS) {
                     val idx = r * GRID_COLS + c
@@ -536,6 +572,18 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     if (dSq <= 1.05f) {
                         val boost = exp(-dSq / 0.85f) * 0.42f
                         tileProgress[idx] = max(tileProgress[idx], (tileProgress[idx] + boost).coerceAtMost(1f))
+                    }
+                    val aimWeight = exp(-dSq / 1.15f).coerceIn(0.32f, 1f)
+                    val tileContrib = (patchQualities[idx] * aimWeight).coerceIn(0f, 1f)
+                    val prevTileQ = bestTileQuality[idx]
+                    if (prevTileQ > 0.12f && dSq <= 0.65f) {
+                        aimedOverVisitedTile = true
+                    }
+                    if (prevTileQ > 0.08f && tileContrib > prevTileQ + 0.025f) {
+                        improvedExistingTile = true
+                    }
+                    if (tileContrib > prevTileQ) {
+                        bestTileQuality[idx] = tileContrib
                     }
                 }
             }
@@ -561,7 +609,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
 
-            // Always prefer better-quality present frame over a weaker previous frame at the same viewpoint
+            // Always prefer better-quality frames & retain frames that own crispest local patches for stacking
             var closestIdx = -1
             var closestNormDist = Float.MAX_VALUE
             for (i in framePool.indices) {
@@ -577,36 +625,78 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
 
+            val prevAvgQual = if (framePool.isNotEmpty()) {
+                framePool.map { it.frameQuality }.average().toFloat()
+            } else {
+                0f
+            }
+
+            var comparisonStatus = FrameComparisonStatus.NONE
             if (closestIdx >= 0 && closestNormDist < SAME_VIEWPOINT_THRESHOLD) {
                 val prev = framePool[closestIdx]
                 if (shouldReplaceWithBetterFrame(candidate.frameQuality, prev.frameQuality)) {
                     prev.colorBitmap.recycle()
                     framePool[closestIdx] = candidate
+                    comparisonStatus = FrameComparisonStatus.BETTER
                 } else {
-                    candidate.colorBitmap.recycle()
+                    // Even if overall score didn't beat prev, keep candidate if pool has space & it owns a stronger patch
+                    val ownsBetterPatch = (0 until TILE_COUNT).any { t ->
+                        candidate.patchQualities[t] > prev.patchQualities[t] + 0.08f
+                    }
+                    if (ownsBetterPatch && framePool.size < MAX_FRAME_POOL) {
+                        framePool.add(candidate)
+                        comparisonStatus = FrameComparisonStatus.BETTER
+                    } else {
+                        candidate.colorBitmap.recycle()
+                        comparisonStatus = if (improvedExistingTile) {
+                            FrameComparisonStatus.BETTER
+                        } else {
+                            FrameComparisonStatus.WORSE
+                        }
+                    }
                 }
             } else if (framePool.size < MAX_FRAME_POOL) {
+                val hadBaseline = framePool.isNotEmpty()
                 framePool.add(candidate)
+                if (hadBaseline) {
+                    comparisonStatus = when {
+                        improvedExistingTile || candidate.frameQuality >= prevAvgQual * 0.96f -> FrameComparisonStatus.BETTER
+                        aimedOverVisitedTile || candidate.frameQuality < prevAvgQual * 0.85f -> FrameComparisonStatus.WORSE
+                        else -> FrameComparisonStatus.BETTER
+                    }
+                }
             } else {
-                // Keep crispest, well-spread frames by upgrading closest or weakest slot when present shot is better
+                // Protect frames that are the top patch donor for any tile
+                val bestDonorForTile = IntArray(TILE_COUNT) { t ->
+                    framePool.indices.maxByOrNull { framePool[it].patchQualities[t] } ?: -1
+                }
                 val replaceIdx = if (closestIdx >= 0 && closestNormDist < 0.45f) {
                     closestIdx
                 } else {
-                    framePool.indices.minByOrNull { framePool[it].frameQuality } ?: -1
+                    framePool.indices.minByOrNull { i ->
+                        val uniquePatches = bestDonorForTile.count { it == i }
+                        framePool[i].frameQuality + uniquePatches * 0.25f
+                    } ?: -1
                 }
                 if (replaceIdx >= 0 && shouldReplaceWithBetterFrame(candidate.frameQuality, framePool[replaceIdx].frameQuality)) {
                     framePool[replaceIdx].colorBitmap.recycle()
                     framePool[replaceIdx] = candidate
+                    comparisonStatus = FrameComparisonStatus.BETTER
                 } else {
                     candidate.colorBitmap.recycle()
+                    comparisonStatus = if (improvedExistingTile) FrameComparisonStatus.BETTER else FrameComparisonStatus.WORSE
                 }
             }
 
             val cleared = tileProgress.count { it >= TILE_DONE_THRESHOLD }
             val avgDetail = (tileProgress.sum() / TILE_COUNT * 100f).roundToInt().coerceIn(0, 100)
             val (qScore, qTier) = currentQualityState()
+            val tileQualList = bestTileQuality.toList()
             _uiState.value = _uiState.value.copy(
                 tileDetails = tileProgress.toList(),
+                tileQualities = tileQualList,
+                weakestAreaIndex = computeWeakestAreaIndex(tileQualList),
+                lastFrameComparison = comparisonStatus,
                 clearedTilesCount = cleared,
                 detailPercent = avgDetail,
                 qualityScore = qScore,
@@ -781,6 +871,9 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 _uiState.value = _uiState.value.copy(
                     phase = CapturePhase.READY,
                     tileDetails = List(TILE_COUNT) { 0f },
+                    tileQualities = List(TILE_COUNT) { 0f },
+                    weakestAreaIndex = null,
+                    lastFrameComparison = FrameComparisonStatus.NONE,
                     clearedTilesCount = 0,
                     detailPercent = 0,
                     capturedFrameCount = 0,
@@ -801,6 +894,9 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 _uiState.value = _uiState.value.copy(
                     phase = CapturePhase.READY,
                     tileDetails = List(TILE_COUNT) { 0f },
+                    tileQualities = List(TILE_COUNT) { 0f },
+                    weakestAreaIndex = null,
+                    lastFrameComparison = FrameComparisonStatus.NONE,
                     clearedTilesCount = 0,
                     detailPercent = 0,
                     capturedFrameCount = 0,
@@ -850,6 +946,9 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         _uiState.value = _uiState.value.copy(
             phase = CapturePhase.READY,
             tileDetails = List(TILE_COUNT) { 0f },
+            tileQualities = List(TILE_COUNT) { 0f },
+            weakestAreaIndex = null,
+            lastFrameComparison = FrameComparisonStatus.NONE,
             clearedTilesCount = 0,
             detailPercent = 0,
             capturedFrameCount = 0,
@@ -911,7 +1010,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         const val TILE_DONE_THRESHOLD = 0.85f
 
         private const val MIN_FRAMES_TO_ACCEPT = 2
-        private const val MAX_FRAME_POOL = 14
+        private const val MAX_FRAME_POOL = 16
         private const val SAME_VIEWPOINT_THRESHOLD = 0.24f
         private const val TILT_LEVEL_TOLERANCE_DEG = 4.2f
         private const val MAX_CAPTURE_GYRO_RAD_PER_SEC = 1.35f
@@ -919,6 +1018,23 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         // Natural ~2.2-inch left/right and up/down wave radius
         private const val WAVE_HALF_SPAN_METERS = 0.055f
         private const val WAVE_HALF_SPAN_DEG = 5.5f
+
+        internal fun computeWeakestAreaIndex(tileQualities: List<Float>): Int? {
+            if (tileQualities.isEmpty()) return null
+            var minIdx = 0
+            var minVal = tileQualities[0]
+            var maxVal = tileQualities[0]
+            for (i in 1 until tileQualities.size) {
+                val q = tileQualities[i]
+                if (q < minVal) {
+                    minVal = q
+                    minIdx = i
+                }
+                if (q > maxVal) maxVal = q
+            }
+            if (maxVal < 0.25f) return null
+            return if (minVal < 0.65f || (maxVal - minVal) >= 0.18f && minVal < 0.78f) minIdx else null
+        }
 
         internal fun computeBrushGridPos(
             nx: Float,

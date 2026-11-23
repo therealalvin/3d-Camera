@@ -6,13 +6,15 @@
 
 ## Features
 
-- **Adaptive Sweep Capture & Red → Green Quality Meter**:
+- **Adaptive Sweep, Per-Area Detail Map & Red → Green Quality Meter**:
   - Captures frames continuously as you move smoothly around your subject—no rigid box-by-box completion required.
+  - A live color-coded **3×3 Detail Coverage Overlay** (`Red` low/missing, `Amber` fair, `Green` crisp) highlights the weakest region (`Low detail: <Region> — move there`) so you know exactly where to move next.
   - A live **Image Quality** indicator transitions smoothly from **Poor (Red)** through **Fair** and **Good** to **Excellent (Green)** based on frame count, horizontal/vertical baseline coverage, optical sharpness, steadiness, and depth density.
   - Explicit **Accept** and **Cancel** buttons let you decide when quality looks good enough to build the 3D photo.
-- **Automatic Best-Frame Quality Replacement**:
-  - Every candidate shot during capture is scored in real time for optical sharpness, gyro steadiness, levelness, and `Depth16` coverage.
-  - Moving over an already-visited angle automatically replaces a weaker earlier shot whenever the present frame has higher quality.
+- **Live Better/Worse Feedback & Best-Patch Multi-Frame Stacking**:
+  - Every candidate shot during capture is scored in real time for optical sharpness, gyro steadiness, levelness, and `Depth16` coverage, displaying live **Better than before** / **Worse than before** feedback as you move.
+  - Moving over an area automatically upgrades weaker frames while protecting top per-region patch donors.
+  - During 3D synthesis, overlapping `24×24` tent-feathered patches across up to 6 pose-rectified frames are stacked (`preferSharpestPatches`) so the sharpest local regions from each capture combine into the final photo.
 - **Live Spirit-Level Tilt Meter**:
   - Real-time 2-axis bubble level and gimbal-lock-free 3D orientation tracking help you keep tilt steady while sweeping, while small accidental roll/pitch offsets are mathematically compensated during alignment.
 - **Pose-Guided Rectification & Distortion-Free Fusion**:
@@ -20,9 +22,9 @@
 - **Dual Depth Pipeline (ARCore + CameraX Fallback)**:
   - **ARCore Hardware Depth Boost**: Fuses warped metric `Depth16` maps across aligned frames with joint bilateral refinement and hole-filling.
   - **CameraX + IMU Stereo Fallback**: Works on devices without ARCore using rectified stereo disparity matching, `3×3` median despiking, and texture-contrast gating.
-- **Natural Touch 3D Look-Around & Pinch-to-Zoom (Preview & Viewer)**:
-  - Drag smoothly with one finger to look around your 3D photo naturally in both post-capture preview and fullscreen viewer—holding your inspected perspective without requiring phone tilting.
-  - Two-finger **pinch to zoom in (`1.0×`–`4.0×`)** anchored at the pinch centroid and **pinch out** cleanly back to full frame, with bounded panning and **double-tap** to reset view.
+- **True 3D Perspective Tilt, Twist Rotation & Pinch-to-Zoom (Preview & Viewer)**:
+  - Drag smoothly with one finger to tilt the photo in true 3D perspective space (pitch & yaw) rather than stretching 2D pixels—holding your inspected perspective without requiring phone tilting.
+  - Two-finger **twist to rotate** around the 3D Z-axis and **pinch to zoom in (`1.0×`–`4.0×`)** anchored at the pinch centroid, with bounded panning and **double-tap** to reset view.
 - **Universal Compatibility & VR Export**:
   - Embeds standard **Google GDepth XMP** metadata (`RangeInverse`) inside JPEG `APP1` / Extended XMP segments.
   - Opens any existing GDepth JPEG via Android's zero-permission Photo Picker or `ACTION_VIEW` intent.
@@ -54,15 +56,15 @@ app/src/main/java/com/example/
 ├── capture/
 │   ├── ArCoreBackgroundRenderer.kt     # ARCore camera pass-through GL background renderer
 │   ├── CameraPreviewHost.kt            # ARCore Depth16 + CameraX fallback pipeline
-│   ├── CaptureViewModel.kt             # Adaptive sweep, Red->Green quality meter & best-frame replacement
+│   ├── CaptureViewModel.kt             # Adaptive sweep, 3x3 detail scores, Better/Worse feedback & best-frame pool
 │   ├── MotionSensorMonitor.kt          # Gimbal-lock-free 3D basis & spirit-level sensor math
-│   ├── SmartCaptureHelpers.kt          # Relative 3D pose, quaternion math, depth density & sharpness scoring
+│   ├── SmartCaptureHelpers.kt          # Relative 3D pose, 3x3 grid patch sharpness & depth density scoring
 │   └── YuvBitmapConverter.kt           # Fast YUV_420_888 to upright Bitmap conversion
 ├── imaging/
-│   └── DynamicDepthCodec.kt            # Projective rectification, multi-frame fusion, GDepth XMP & SBS VR export
+│   └── DynamicDepthCodec.kt            # Projective rectification, best-patch stacking, GDepth XMP & SBS VR export
 ├── viewer/
-│   ├── SpatialParallaxSurfaceView.kt   # Battery-efficient OpenGL ES 2.0 3D parallax, zoom & pan renderer
-│   ├── SpatialViewGestures.kt          # Natural finger-drag 3D look-around, pinch-to-zoom & double-tap reset
+│   ├── SpatialParallaxSurfaceView.kt   # True 3D perspective camera OpenGL ES 2.0 parallax, rotation & zoom renderer
+│   ├── SpatialViewGestures.kt          # 3D tilt drag, two-finger twist rotation, pinch-to-zoom & double-tap reset
 │   └── ViewerViewModel.kt              # Photo loading, Quest SBS VR export & delete state
 ├── data/
 │   ├── AppDatabase.kt                  # Room database
@@ -71,10 +73,10 @@ app/src/main/java/com/example/
 │   ├── SpatialPhotoDao.kt              # Room DAO
 │   └── SpatialPhotoEntity.kt           # Local metadata entity
 └── ui/
-    ├── CaptureCameraScreen.kt          # Adaptive viewfinder, Red->Green quality meter, tilt meter & Accept/Cancel
-    ├── ReviewPhotoScreen.kt            # Post-capture 3D drag/pinch preview with Save or Retake actions
+    ├── CaptureCameraScreen.kt          # Adaptive viewfinder, 3x3 detail map, Red->Green meter & Accept/Cancel
+    ├── ReviewPhotoScreen.kt            # Post-capture 3D tilt/rotate/pinch preview with Save or Retake actions
     ├── SimpleGalleryScreen.kt          # Saved 3D photo grid & zero-permission Photo Picker entry
-    ├── CleanViewer3DScreen.kt          # Fullscreen drag/pinch 3D viewer, VR export & delete
+    ├── CleanViewer3DScreen.kt          # Fullscreen 3D tilt/rotate/pinch viewer, VR export & delete
     └── theme/                          # Material 3 colors, shapes & typography
 ```
 
@@ -97,6 +99,7 @@ app/src/main/java/com/example/
    ```bash
    ./gradlew :app:assembleDebug
    ```
+   A pre-built debug package is also included at `apk/3dCamera-v13-debug.apk` (`versionCode 13`).
 3. **Run Unit & Robolectric Tests**:
    ```bash
    ./gradlew :app:testDebugUnitTest

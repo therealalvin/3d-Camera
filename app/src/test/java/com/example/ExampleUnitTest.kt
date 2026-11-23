@@ -143,10 +143,10 @@ class ExampleUnitTest {
     fun spatialViewportStateSupportsFingerDragLookPinchZoomAndReset() {
         val state = SpatialViewportState()
 
-        // Drag right & down without zooming: shifts 3D look-around naturally, zoom stays 1f
+        // Drag right & up without zooming: shifts 3D tilt smoothly, zoom stays 1f
         state.applyTransform(
             centroid = Offset(500f, 500f),
-            pan = Offset(170f, -85f),
+            pan = Offset(180f, -90f),
             zoomChange = 1f,
             viewWidth = 1000f,
             viewHeight = 2000f
@@ -180,11 +180,45 @@ class ExampleUnitTest {
         assertEquals(0f, state.panX, 1e-4f)
         assertEquals(0f, state.panY, 1e-4f)
 
-        // Reset restores centered neutral state
+        // Twist with two fingers rotates rollDeg around Z axis and wraps cleanly
+        state.applyTransform(
+            centroid = Offset(500f, 1000f),
+            pan = Offset.Zero,
+            zoomChange = 1f,
+            viewWidth = 1000f,
+            viewHeight = 2000f,
+            rotationChange = 45f
+        )
+        assertEquals(45f, state.rollDeg, 0.01f)
+        state.applyTransform(
+            centroid = Offset(500f, 1000f),
+            pan = Offset.Zero,
+            zoomChange = 1f,
+            viewWidth = 1000f,
+            viewHeight = 2000f,
+            rotationChange = 160f
+        )
+        assertEquals(-155f, state.rollDeg, 0.01f)
+
+        // Reset restores centered neutral state including 3D roll
         state.reset()
         assertEquals(0f, state.lookX, 1e-4f)
         assertEquals(0f, state.lookY, 1e-4f)
+        assertEquals(0f, state.rollDeg, 1e-4f)
         assertEquals(1f, state.zoom, 1e-4f)
+    }
+
+    @Test
+    fun computeWeakestAreaIndexFlagsLaggingTileAndClearsWhenBalanced() {
+        val balanced = List(9) { 0.85f }
+        assertEquals(null, CaptureViewModel.computeWeakestAreaIndex(balanced))
+
+        val weakTopLeft = listOf(
+            0.22f, 0.78f, 0.80f,
+            0.76f, 0.88f, 0.79f,
+            0.75f, 0.82f, 0.77f
+        )
+        assertEquals(0, CaptureViewModel.computeWeakestAreaIndex(weakTopLeft))
     }
 
     @Test

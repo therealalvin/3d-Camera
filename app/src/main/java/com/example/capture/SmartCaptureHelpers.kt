@@ -305,6 +305,63 @@ object SmartCaptureHelpers {
         return if (count > 0) (energy / count).toFloat() else 0f
     }
 
+    /**
+     * Computes normalized [0f..1f] local edge sharpness across a cols x rows spatial grid
+     * using 2x2-box smoothed luminance gradients (suppresses single-pixel sensor noise).
+     */
+    fun measureGridPatchSharpness(
+        bitmap: Bitmap,
+        cols: Int = 3,
+        rows: Int = 3
+    ): FloatArray {
+        val out = FloatArray(cols * rows)
+        if (cols <= 0 || rows <= 0 || bitmap.isRecycled || bitmap.width < 4 || bitmap.height < 4) {
+            return out
+        }
+        val sampleW = 96
+        val sampleH = 96
+        val thumb = Bitmap.createScaledBitmap(bitmap, sampleW, sampleH, true)
+        val px = IntArray(sampleW * sampleH)
+        thumb.getPixels(px, 0, sampleW, 0, 0, sampleW, sampleH)
+        if (thumb !== bitmap) thumb.recycle()
+
+        val luma = FloatArray(sampleW * sampleH)
+        for (i in px.indices) {
+            val c = px[i]
+            luma[i] = ((c shr 16) and 0xFF) * 0.299f +
+                ((c shr 8) and 0xFF) * 0.587f +
+                (c and 0xFF) * 0.114f
+        }
+
+        for (r in 0 until rows) {
+            val y0 = (r * sampleH / rows).coerceIn(1, sampleH - 3)
+            val y1 = (((r + 1) * sampleH / rows)).coerceIn(y0 + 1, sampleH - 2)
+            for (c in 0 until cols) {
+                val x0 = (c * sampleW / cols).coerceIn(1, sampleW - 3)
+                val x1 = (((c + 1) * sampleW / cols)).coerceIn(x0 + 1, sampleW - 2)
+                var gradSum = 0.0
+                var count = 0
+                for (y in y0 until y1) {
+                    val row = y * sampleW
+                    val nextRow = (y + 1) * sampleW
+                    val prevRow = (y - 1) * sampleW
+                    for (x in x0 until x1) {
+                        val b0 = (luma[row + x] + luma[row + x + 1] + luma[nextRow + x] + luma[nextRow + x + 1]) * 0.25f
+                        val bx = (luma[row + x - 1] + luma[row + x] + luma[nextRow + x - 1] + luma[nextRow + x]) * 0.25f
+                        val by = (luma[prevRow + x] + luma[prevRow + x + 1] + luma[row + x] + luma[row + x + 1]) * 0.25f
+                        val dx = abs(b0 - bx)
+                        val dy = abs(b0 - by)
+                        gradSum += (dx + dy) * 0.5f
+                        count++
+                    }
+                }
+                val avgGrad = if (count > 0) (gradSum / count).toFloat() else 0f
+                out[r * cols + c] = (avgGrad / 14f).coerceIn(0f, 1f)
+            }
+        }
+        return out
+    }
+
     fun scaleDownMaxEdge(bitmap: Bitmap, maxEdge: Int = 1600): Bitmap {
         val longest = maxOf(bitmap.width, bitmap.height)
         if (longest <= maxEdge) return bitmap

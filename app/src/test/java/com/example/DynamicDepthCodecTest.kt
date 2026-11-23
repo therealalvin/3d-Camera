@@ -359,4 +359,48 @@ class DynamicDepthCodecTest {
         val shiftedRightEdge = warped.millimeters[20 * w + 26].toInt() and 0xFFFF
         assertEquals(800, shiftedRightEdge)
     }
+
+    @Test
+    fun `enhanceHeroWithAlignedFrames stacks sharper aligned patches over softer hero areas`() {
+        val w = 96
+        val h = 96
+        val hero = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val sharpNeighbor = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val baseVal = 120
+                // Top-left patch in hero is soft/blurred (+-2), while sharpNeighbor has crisp detail (+-10)
+                // Keep within color consistency threshold so stationary edge stacking amplifies the crisp patch
+                val stripe = if (((x / 3) + (y / 3)) % 2 == 0) 1 else -1
+                val heroDelta = if (x < 48 && y < 48) stripe * 2 else stripe * 10
+                val nbDelta = if (x < 48 && y < 48) stripe * 10 else stripe * 2
+                hero.setPixel(x, y, Color.rgb(baseVal + heroDelta, baseVal + heroDelta, baseVal + heroDelta))
+                sharpNeighbor.setPixel(x, y, Color.rgb(baseVal + nbDelta, baseVal + nbDelta, baseVal + nbDelta))
+            }
+        }
+
+        val stacked = DynamicDepthCodec.enhanceHeroWithAlignedFrames(
+            heroBitmap = hero,
+            rectifiedFrames = listOf(
+                com.example.imaging.RectifiedFrameResult(
+                    bitmap = sharpNeighbor,
+                    residualDxPx = 0f,
+                    residualDyPx = 0f,
+                    edgeMatchScore = 0.92f,
+                    relRollDeg = 0f
+                )
+            )
+        )
+
+        // Contrast in top-left should increase above hero's soft +-2 toward neighbor's crisp +-10
+        var maxTopLeftDiff = 0
+        for (y in 12 until 36) {
+            for (x in 12 until 35) {
+                val d = kotlin.math.abs(Color.red(stacked.getPixel(x, y)) - Color.red(stacked.getPixel(x + 3, y)))
+                if (d > maxTopLeftDiff) maxTopLeftDiff = d
+            }
+        }
+        assertTrue("Expected stacked top-left patch contrast > 8, got $maxTopLeftDiff", maxTopLeftDiff > 8)
+    }
 }

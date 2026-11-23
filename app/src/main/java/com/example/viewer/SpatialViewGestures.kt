@@ -18,6 +18,7 @@ import kotlin.math.min
 class SpatialViewportState(
     initialLookX: Float = 0f,
     initialLookY: Float = 0f,
+    initialRollDeg: Float = 0f,
     initialZoom: Float = 1f,
     initialPanX: Float = 0f,
     initialPanY: Float = 0f
@@ -25,6 +26,8 @@ class SpatialViewportState(
     var lookX by mutableFloatStateOf(initialLookX)
         private set
     var lookY by mutableFloatStateOf(initialLookY)
+        private set
+    var rollDeg by mutableFloatStateOf(initialRollDeg)
         private set
     var zoom by mutableFloatStateOf(initialZoom)
         private set
@@ -38,7 +41,8 @@ class SpatialViewportState(
         pan: Offset,
         zoomChange: Float,
         viewWidth: Float,
-        viewHeight: Float
+        viewHeight: Float,
+        rotationChange: Float = 0f
     ) {
         if (viewWidth <= 1f || viewHeight <= 1f) return
 
@@ -59,23 +63,29 @@ class SpatialViewportState(
         } else {
             val anchoredPanX = cxNdc - (cxNdc - panX) * scaleRatio + panDeltaNdcX
             val anchoredPanY = cyNdc - (cyNdc - panY) * scaleRatio + panDeltaNdcY
-            val maxPan = (newZoom * 1.16f - 1f).coerceAtLeast(0f)
+            val maxPan = (newZoom - 1f).coerceAtLeast(0f)
             panX = anchoredPanX.coerceIn(-maxPan, maxPan)
             panY = anchoredPanY.coerceIn(-maxPan, maxPan)
         }
         zoom = newZoom
 
-        // Drive natural finger-follow 3D look-around when dragging
-        if (abs(zoomChange - 1f) < 0.04f && (pan.x != 0f || pan.y != 0f)) {
-            val lookSpanPx = (min(viewWidth, viewHeight) * 0.34f).coerceAtLeast(48f)
-            lookX = (lookX + pan.x / lookSpanPx).coerceIn(-1f, 1f)
-            lookY = (lookY + pan.y / lookSpanPx).coerceIn(-1f, 1f)
+        if (abs(rotationChange) > 0.01f) {
+            rollDeg = wrapRollDegrees(rollDeg + rotationChange)
+        }
+
+        // Drive smooth 3D yaw/pitch tilt when dragging (without jumping during strong pinch/twist)
+        if (abs(zoomChange - 1f) < 0.04f && abs(rotationChange) < 2.5f && (pan.x != 0f || pan.y != 0f)) {
+            val lookSpanPx = (min(viewWidth, viewHeight) * 0.36f).coerceAtLeast(48f)
+            val zoomDampen = if (newZoom > 1.15f) 0.55f else 1.0f
+            lookX = (lookX + (pan.x / lookSpanPx) * zoomDampen).coerceIn(-1f, 1f)
+            lookY = (lookY + (pan.y / lookSpanPx) * zoomDampen).coerceIn(-1f, 1f)
         }
     }
 
     fun reset() {
         lookX = 0f
         lookY = 0f
+        rollDeg = 0f
         zoom = 1f
         panX = 0f
         panY = 0f
@@ -84,6 +94,12 @@ class SpatialViewportState(
     companion object {
         const val MIN_ZOOM = 1f
         const val MAX_ZOOM = 4f
+
+        fun wrapRollDegrees(deg: Float): Float {
+            var r = ((deg + 180f) % 360f + 360f) % 360f - 180f
+            if (r == -180f && deg > 0f) r = 180f
+            return r
+        }
     }
 }
 
@@ -107,13 +123,14 @@ fun Modifier.spatialLookAndZoomGestures(
         )
     }
     .pointerInput(state) {
-        detectTransformGestures(panZoomLock = false) { centroid, pan, zoomChange, _ ->
+        detectTransformGestures(panZoomLock = false) { centroid, pan, zoomChange, rotationChange ->
             state.applyTransform(
                 centroid = centroid,
                 pan = pan,
                 zoomChange = zoomChange,
                 viewWidth = size.width.toFloat(),
-                viewHeight = size.height.toFloat()
+                viewHeight = size.height.toFloat(),
+                rotationChange = rotationChange
             )
         }
     }

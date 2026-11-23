@@ -43,6 +43,8 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.ArrowDownward
+import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.Check
@@ -100,6 +102,7 @@ import com.example.capture.CameraPreviewHost
 import com.example.capture.CapturePhase
 import com.example.capture.CaptureQualityTier
 import com.example.capture.CaptureViewModel
+import com.example.capture.FrameComparisonStatus
 import com.example.ui.theme.ErrorCrimson
 import com.example.ui.theme.ObsidianBackground
 import com.example.ui.theme.QualityEmerald
@@ -334,6 +337,8 @@ fun CaptureCameraScreen(
             ) {
                 DetailCoverageOverlay(
                     tileDetails = uiState.tileDetails,
+                    tileQualities = uiState.tileQualities,
+                    weakestAreaIndex = uiState.weakestAreaIndex,
                     brushX = uiState.brushX,
                     brushY = uiState.brushY,
                     isWarning = uiState.isMovingTooFast
@@ -372,6 +377,8 @@ fun CaptureCameraScreen(
                     qualityScore = uiState.qualityScore,
                     qualityTier = uiState.qualityTier,
                     frameCount = uiState.capturedFrameCount,
+                    lastFrameComparison = uiState.lastFrameComparison,
+                    weakestAreaIndex = uiState.weakestAreaIndex,
                     tiltX = uiState.tiltMeterX,
                     tiltY = uiState.tiltMeterY,
                     isTiltOffLevel = uiState.isTiltOffLevel
@@ -770,6 +777,8 @@ private fun ReadyWaveHintChip(
 @Composable
 private fun DetailCoverageOverlay(
     tileDetails: List<Float>,
+    tileQualities: List<Float>,
+    weakestAreaIndex: Int?,
     brushX: Float,
     brushY: Float,
     isWarning: Boolean,
@@ -803,48 +812,52 @@ private fun DetailCoverageOverlay(
             for (c in 0 until cols) {
                 val idx = r * cols + c
                 val detail = tileDetails.getOrElse(idx) { 0f }.coerceIn(0f, 1f)
-                val isDone = detail >= CaptureViewModel.TILE_DONE_THRESHOLD
+                val areaQuality = tileQualities.getOrElse(idx) { 0f }.coerceIn(0f, 1f)
+                val effectiveQuality = (areaQuality * 0.72f + detail * 0.28f).coerceIn(0f, 1f)
+                val isStrong = effectiveQuality >= 0.68f
+                val isWeakest = weakestAreaIndex == idx
                 val topLeft = Offset(c * (cellW + gap), r * (cellH + gap))
                 val cellSize = Size(cellW, cellH)
                 val cellCenter = Offset(topLeft.x + cellW / 2f, topLeft.y + cellH / 2f)
 
-                if (isDone) {
-                    // Wiped clean: let live camera show cleanly with a crisp faint mint frame
+                if (isStrong && !isWeakest) {
+                    // Crisp captured area: clear viewfinder with subtle green frame
                     drawRoundRect(
-                        color = SpatialMint.copy(alpha = 0.28f),
-                        topLeft = topLeft,
-                        size = cellSize,
-                        cornerRadius = corner,
-                        style = Stroke(width = 1.dp.toPx())
-                    )
-                } else {
-                    // Needs detail: soft chalkboard mist that clears as detail approaches 80%+
-                    val remaining = 1f - (detail / CaptureViewModel.TILE_DONE_THRESHOLD)
-                    drawRoundRect(
-                        color = ObsidianBackground.copy(alpha = 0.42f * remaining),
-                        topLeft = topLeft,
-                        size = cellSize,
-                        cornerRadius = corner
-                    )
-                    drawRoundRect(
-                        color = (if (detail > 0.25f) SpatialMint else Color.White)
-                            .copy(alpha = 0.28f + 0.16f * remaining),
+                        color = QualityGreen.copy(alpha = 0.36f),
                         topLeft = topLeft,
                         size = cellSize,
                         cornerRadius = corner,
                         style = Stroke(width = 1.25.dp.toPx())
                     )
-                    // Subtle center dot highlighting unfinished regions
+                } else {
+                    val areaColor = when {
+                        isWeakest || effectiveQuality < 0.36f -> ErrorCrimson
+                        else -> WarmAmber
+                    }
+                    val weakness = (1f - effectiveQuality / 0.68f).coerceIn(0.15f, 1f)
+                    drawRoundRect(
+                        color = areaColor.copy(alpha = if (isWeakest) 0.22f * mistPulse else 0.14f * weakness),
+                        topLeft = topLeft,
+                        size = cellSize,
+                        cornerRadius = corner
+                    )
+                    drawRoundRect(
+                        color = areaColor.copy(alpha = if (isWeakest) 0.75f * mistPulse else 0.45f),
+                        topLeft = topLeft,
+                        size = cellSize,
+                        cornerRadius = corner,
+                        style = Stroke(width = if (isWeakest) 2.dp.toPx() else 1.25.dp.toPx())
+                    )
                     drawCircle(
-                        color = Color.White.copy(alpha = mistPulse * 0.55f * remaining),
-                        radius = 4.dp.toPx(),
+                        color = areaColor.copy(alpha = mistPulse * 0.85f),
+                        radius = if (isWeakest) 5.5.dp.toPx() else 3.5.dp.toPx(),
                         center = cellCenter
                     )
                 }
             }
         }
 
-        // Live chalkboard eraser brush halo following your hand motion
+        // Live brush halo following your hand motion
         val bx = ((brushX.coerceIn(-1f, 1f) * 0.5f + 0.5f) * size.width)
         val by = ((brushY.coerceIn(-1f, 1f) * 0.5f + 0.5f) * size.height)
         val brushPos = Offset(bx, by)
@@ -877,10 +890,28 @@ private fun qualityGradientColor(score: Float): Color {
 }
 
 @Composable
+private fun areaLabelForIndex(index: Int): String {
+    return when (index) {
+        0 -> stringResource(R.string.capture_area_top_left)
+        1 -> stringResource(R.string.capture_area_top)
+        2 -> stringResource(R.string.capture_area_top_right)
+        3 -> stringResource(R.string.capture_area_left)
+        4 -> stringResource(R.string.capture_area_center)
+        5 -> stringResource(R.string.capture_area_right)
+        6 -> stringResource(R.string.capture_area_bottom_left)
+        7 -> stringResource(R.string.capture_area_bottom)
+        8 -> stringResource(R.string.capture_area_bottom_right)
+        else -> stringResource(R.string.capture_area_center)
+    }
+}
+
+@Composable
 private fun CaptureQualityMeterRow(
     qualityScore: Float,
     qualityTier: CaptureQualityTier,
     frameCount: Int,
+    lastFrameComparison: FrameComparisonStatus,
+    weakestAreaIndex: Int?,
     tiltX: Float,
     tiltY: Float,
     isTiltOffLevel: Boolean,
@@ -906,87 +937,148 @@ private fun CaptureQualityMeterRow(
     val percent = (qualityScore * 100f).roundToInt().coerceIn(0, 100)
     val summaryText = stringResource(R.string.capture_quality_summary, tierLabel, percent, frameCount)
 
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
         modifier = modifier.widthIn(max = 460.dp)
     ) {
-        Surface(
-            shape = RoundedCornerShape(18.dp),
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
-            border = BorderStroke(1.dp, qualityColor.copy(alpha = 0.6f)),
-            modifier = Modifier
-                .weight(1f)
-                .testTag("capture_quality_meter")
-        ) {
-            Column(
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+        if (lastFrameComparison != FrameComparisonStatus.NONE || weakestAreaIndex != null) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                if (lastFrameComparison != FrameComparisonStatus.NONE) {
+                    val isBetter = lastFrameComparison == FrameComparisonStatus.BETTER
+                    val badgeColor = if (isBetter) QualityGreen else ErrorCrimson
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+                        border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.65f)),
+                        modifier = Modifier.testTag("frame_comparison_badge")
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(9.dp)
-                                .clip(CircleShape)
-                                .background(qualityColor)
-                        )
-                        Text(
-                            text = summaryText,
-                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isBetter) Icons.Rounded.ArrowUpward else Icons.Rounded.ArrowDownward,
+                                contentDescription = null,
+                                tint = badgeColor,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = stringResource(
+                                    if (isBetter) R.string.capture_status_better else R.string.capture_status_worse
+                                ),
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = badgeColor
+                            )
+                        }
                     }
                 }
 
-                // Red -> Amber -> Green bar track with glowing animated fill
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(10.dp)
-                        .clip(RoundedCornerShape(50))
-                        .background(
-                            Brush.horizontalGradient(
-                                listOf(
-                                    ErrorCrimson.copy(alpha = 0.24f),
-                                    WarmAmber.copy(alpha = 0.24f),
-                                    QualityGreen.copy(alpha = 0.24f),
-                                    QualityEmerald.copy(alpha = 0.26f)
-                                )
-                            )
+                if (weakestAreaIndex != null) {
+                    val regionName = areaLabelForIndex(weakestAreaIndex)
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+                        border = BorderStroke(1.dp, WarmAmber.copy(alpha = 0.65f)),
+                        modifier = Modifier.testTag("weakest_area_badge")
+                    ) {
+                        Text(
+                            text = stringResource(R.string.capture_weak_area_hint, regionName),
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = WarmAmber,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
                         )
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxHeight()
-                            .fillMaxWidth(animatedScore.coerceAtLeast(0.04f))
-                            .clip(RoundedCornerShape(50))
-                            .background(
-                                Brush.horizontalGradient(
-                                    listOf(
-                                        ErrorCrimson,
-                                        if (animatedScore >= 0.35f) WarmAmber else ErrorCrimson,
-                                        qualityColor
-                                    )
-                                )
-                            )
-                    )
+                    }
                 }
             }
         }
 
-        TiltLevelMeterPill(
-            tiltX = tiltX,
-            tiltY = tiltY,
-            isOffLevel = isTiltOffLevel
-        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+                border = BorderStroke(1.dp, qualityColor.copy(alpha = 0.6f)),
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("capture_quality_meter")
+            ) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(7.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(9.dp)
+                                    .clip(CircleShape)
+                                    .background(qualityColor)
+                            )
+                            Text(
+                                text = summaryText,
+                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
+
+                    // Red -> Amber -> Green bar track with glowing animated fill
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(10.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(
+                                Brush.horizontalGradient(
+                                    listOf(
+                                        ErrorCrimson.copy(alpha = 0.24f),
+                                        WarmAmber.copy(alpha = 0.24f),
+                                        QualityGreen.copy(alpha = 0.24f),
+                                        QualityEmerald.copy(alpha = 0.26f)
+                                    )
+                                )
+                            )
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .fillMaxWidth(animatedScore.coerceAtLeast(0.04f))
+                                .clip(RoundedCornerShape(50))
+                                .background(
+                                    Brush.horizontalGradient(
+                                        listOf(
+                                            ErrorCrimson,
+                                            if (animatedScore >= 0.35f) WarmAmber else ErrorCrimson,
+                                            qualityColor
+                                        )
+                                    )
+                                )
+                        )
+                    }
+                }
+            }
+
+            TiltLevelMeterPill(
+                tiltX = tiltX,
+                tiltY = tiltY,
+                isOffLevel = isTiltOffLevel
+            )
+        }
     }
 }
 

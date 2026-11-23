@@ -109,9 +109,13 @@ fun CleanViewer3DScreen(
         }
     }
 
-    // Feed touch-drag look-around and pinch zoom/pan into OpenGL ES parallax renderer
+    // Feed touch-drag 3D tilt, 3D twist rotation, and pinch zoom/pan into OpenGL ES renderer
     LaunchedEffect(viewportState.lookX, viewportState.lookY) {
         glSurfaceView.setTiltOffset(viewportState.lookX, viewportState.lookY)
+    }
+
+    LaunchedEffect(viewportState.rollDeg) {
+        glSurfaceView.setRollDegrees(viewportState.rollDeg)
     }
 
     LaunchedEffect(viewportState.zoom, viewportState.panX, viewportState.panY) {
